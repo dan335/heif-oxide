@@ -112,3 +112,137 @@ pub fn decode_first_frame(annex_b: &[u8]) -> Result<Frame, HeifError> {
         .flush()
         .ok_or_else(|| HeifError::Codec("decoder produced no frame".into()))
 }
+
+/// Conservatively inspect the coded dimensions declared by every SPS in an
+/// `hvcC` record. This is used for allocation checks before the decoder sees
+/// the slice payload.
+pub fn coded_dimensions(record: &[u8]) -> Result<(u32, u32), HeifError> {
+    let config = parse_hvcc(record)?;
+    let mut dimensions = None;
+    for parameter_set in &config.parameter_sets {
+        if parameter_set.len() < 2 || (parameter_set[0] >> 1) & 0x3f != 33 {
+            continue;
+        }
+        let candidate = sps_dimensions(parameter_set)?;
+        if dimensions.is_some_and(|existing| existing != candidate) {
+            return Err(HeifError::Invalid(
+                "hvcC contains SPS records with differing dimensions".into(),
+            ));
+        }
+        dimensions = Some(candidate);
+    }
+    dimensions.ok_or_else(|| HeifError::Invalid("hvcC contains no SPS record".into()))
+}
+
+fn sps_dimensions(nalu: &[u8]) -> Result<(u32, u32), HeifError> {
+    let rbsp = remove_emulation_prevention(&nalu[2..]);
+    let mut bits = BitReader::new(&rbsp);
+    bits.skip(4)?;
+    let max_sub_layers_minus_one = bits.read(3)? as usize;
+    bits.skip(1)?;
+    skip_profile_tier_level(&mut bits, max_sub_layers_minus_one)?;
+    bits.read_exp_golomb()?;
+    let chroma_format_idc = bits.read_exp_golomb()?;
+    if chroma_format_idc > 3 {
+        return Err(HeifError::Invalid(
+            "HEVC SPS chroma_format_idc exceeds 3".into(),
+        ));
+    }
+    if chroma_format_idc == 3 {
+        bits.skip(1)?;
+    }
+    let width = bits.read_exp_golomb()?;
+    let height = bits.read_exp_golomb()?;
+    if width == 0 || height == 0 {
+        return Err(HeifError::Invalid("HEVC SPS dimensions are zero".into()));
+    }
+    Ok((width, height))
+}
+
+fn skip_profile_tier_level(
+    bits: &mut BitReader<'_>,
+    max_sub_layers: usize,
+) -> Result<(), HeifError> {
+    bits.skip(96)?;
+    let mut profile_present = [false; 7];
+    let mut level_present = [false; 7];
+    for index in 0..max_sub_layers {
+        profile_present[index] = bits.read(1)? != 0;
+        level_present[index] = bits.read(1)? != 0;
+    }
+    if max_sub_layers > 0 {
+        bits.skip((8 - max_sub_layers) * 2)?;
+    }
+    for index in 0..max_sub_layers {
+        if profile_present[index] {
+            bits.skip(88)?;
+        }
+        if level_present[index] {
+            bits.skip(8)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_emulation_prevention(ebsp: &[u8]) -> Vec<u8> {
+    let mut rbsp = Vec::with_capacity(ebsp.len());
+    let mut zeroes = 0;
+    for &byte in ebsp {
+        if zeroes >= 2 && byte == 3 {
+            zeroes = 0;
+            continue;
+        }
+        rbsp.push(byte);
+        zeroes = if byte == 0 { zeroes + 1 } else { 0 };
+    }
+    rbsp
+}
+
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_offset: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            bit_offset: 0,
+        }
+    }
+
+    fn read(&mut self, count: usize) -> Result<u32, HeifError> {
+        if count > 32 || self.bit_offset.saturating_add(count) > self.data.len().saturating_mul(8) {
+            return Err(HeifError::Truncated("HEVC SPS"));
+        }
+        let mut value = 0_u32;
+        for _ in 0..count {
+            let byte = self.data[self.bit_offset / 8];
+            value = (value << 1) | u32::from((byte >> (7 - self.bit_offset % 8)) & 1);
+            self.bit_offset += 1;
+        }
+        Ok(value)
+    }
+
+    fn skip(&mut self, count: usize) -> Result<(), HeifError> {
+        if self.bit_offset.saturating_add(count) > self.data.len().saturating_mul(8) {
+            return Err(HeifError::Truncated("HEVC SPS"));
+        }
+        self.bit_offset += count;
+        Ok(())
+    }
+
+    fn read_exp_golomb(&mut self) -> Result<u32, HeifError> {
+        let mut leading_zeroes = 0_usize;
+        while self.read(1)? == 0 {
+            leading_zeroes += 1;
+            if leading_zeroes > 31 {
+                return Err(HeifError::Invalid(
+                    "HEVC SPS Exp-Golomb value exceeds u32".into(),
+                ));
+            }
+        }
+        let suffix = self.read(leading_zeroes)?;
+        Ok(((1_u32 << leading_zeroes) - 1).saturating_add(suffix))
+    }
+}

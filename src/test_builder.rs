@@ -68,6 +68,24 @@ pub fn imir(axis: u8) -> Vec<u8> {
     plain_box(b"imir", &[axis & 0x1])
 }
 
+/// A `clap` clean-aperture property box with integral dimensions/offsets.
+pub fn clap(width: u32, height: u32, horizontal_offset: i32, vertical_offset: i32) -> Vec<u8> {
+    let mut body = Vec::new();
+    for value in [
+        width,
+        1,
+        height,
+        1,
+        horizontal_offset as u32,
+        1,
+        vertical_offset as u32,
+        1,
+    ] {
+        body.extend_from_slice(&be32(value));
+    }
+    plain_box(b"clap", &body)
+}
+
 /// A `colr` nclx property box.
 pub fn colr_nclx(primaries: u16, transfer: u16, matrix: u16, full_range: bool) -> Vec<u8> {
     let mut body = Vec::new();
