@@ -26,6 +26,7 @@ pub struct ThumbnailDecodeInfo {
     pub output_height: u32,
     pub estimated_peak_bytes: u64,
     pub grid_streaming: bool,
+    pub has_container_orientation: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +51,7 @@ struct DecodePlan {
     transforms: Vec<Property>,
     optimized: bool,
     grid_streaming: bool,
+    has_container_orientation: bool,
 }
 
 struct Grid {
@@ -79,6 +81,7 @@ pub fn thumbnail_info(
         output_height: plan.output_height as u32,
         estimated_peak_bytes,
         grid_streaming: plan.grid_streaming,
+        has_container_orientation: plan.has_container_orientation,
     })
 }
 
@@ -132,6 +135,11 @@ fn build_plan(
     let primary = container.primary_item;
     let primary_dimensions = item_dimensions(container, primary)?;
     let primary_transforms = item_transforms(container, primary);
+    let has_container_orientation = primary_transforms.iter().any(|property| match property {
+        Property::Irot { angle } => *angle != 0,
+        Property::Imir { .. } => true,
+        _ => false,
+    });
     let primary_geometry = geometry(primary_dimensions, &primary_transforms)?;
     let desired = fit_dimensions(
         primary_geometry.1,
@@ -228,6 +236,7 @@ fn build_plan(
         transforms,
         optimized,
         grid_streaming: optimized && selected_item.item_type == *b"grid",
+        has_container_orientation,
     })
 }
 

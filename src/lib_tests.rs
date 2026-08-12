@@ -340,6 +340,7 @@ fn target_decode_streams_grid_tiles_into_the_scaled_canvas() {
 
     let info = thumbnail_info(&file, 20, 20).expect("probe thumbnail");
     assert!(info.grid_streaming);
+    assert!(!info.has_container_orientation);
     assert_eq!((info.output_width, info.output_height), (20, 10));
     assert!(
         info.estimated_peak_bytes < file.len() as u64 + 100 * 50 * 20,
@@ -419,6 +420,8 @@ fn target_decode_applies_orientation_after_scaling() {
         vec![(true, tb::irot(1))],
     );
 
+    let info = thumbnail_info(&file, 20, 20).expect("probe oriented thumbnail");
+    assert!(info.has_container_orientation);
     let image = decode_thumbnail_bytes(&file, 20, 20).expect("decode oriented thumbnail");
     assert_eq!((image.width, image.height), (10, 20));
     assert!(is_bluish(px(&image, 5, 2)));
