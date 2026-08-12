@@ -373,6 +373,48 @@ fn target_probe_budgets_coded_sps_dimensions_not_only_ispe() {
 }
 
 #[test]
+fn target_probe_budgets_the_primary_when_an_embedded_item_needs_full_fallback() {
+    let (primary_hvcc, primary_payload) = fixture_item("flat_red_64");
+    let (thumbnail_hvcc, thumbnail_payload) = fixture_item("flat_green_64");
+    let (alpha_hvcc, alpha_payload) = fixture_item("flat_gray_64");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"hvc1",
+            payload: primary_payload,
+            props: vec![(true, primary_hvcc), (false, tb::ispe(64, 64))],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: thumbnail_payload,
+            props: vec![(true, thumbnail_hvcc), (false, tb::ispe(1, 1))],
+        },
+        tb::TestItem {
+            id: 3,
+            item_type: *b"hvc1",
+            payload: alpha_payload,
+            props: vec![
+                (true, alpha_hvcc),
+                (
+                    false,
+                    tb::full_box(b"auxC", 0, 0, b"urn:mpeg:hevc:2015:auxid:1\0"),
+                ),
+            ],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"thmb", 2, vec![1]), (*b"auxl", 3, vec![2])]);
+
+    let info = thumbnail_info(&file, 1, 1).expect("probe fallback");
+    assert!(info.used_embedded_thumbnail);
+    assert!(
+        info.estimated_peak_bytes >= file.len() as u64 * 4 + 64 * 64 * 32,
+        "estimate {}",
+        info.estimated_peak_bytes
+    );
+}
+
+#[test]
 fn target_decode_skips_grid_tiles_outside_the_clean_aperture() {
     let (left_hvcc, left_payload) = fixture_item("flat_red_64");
     let (right_hvcc, mut right_payload) = fixture_item("flat_blue_64");

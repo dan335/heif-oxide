@@ -13,7 +13,8 @@ use crate::{
 
 const CODED_PIXEL_PEAK_BYTES: u64 = 16;
 const OUTPUT_PIXEL_PEAK_BYTES: u64 = 12;
-const FULL_DECODE_PIXEL_PEAK_BYTES: u64 = 20;
+const FULL_DECODE_PIXEL_PEAK_BYTES: u64 = 32;
+const FULL_DECODE_SOURCE_MULTIPLIER: u64 = 4;
 
 /// The selected decode path and its conservative peak-memory estimate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -716,11 +717,16 @@ fn estimate_peak_bytes(
 ) -> Result<u64, HeifError> {
     let source_bytes = source_len as u64;
     if !plan.optimized {
-        return Ok(source_bytes.saturating_add(
-            (plan.source_width as u64)
-                .saturating_mul(plan.source_height as u64)
-                .saturating_mul(FULL_DECODE_PIXEL_PEAK_BYTES),
-        ));
+        let mut full_decode_pixels = full_item_pixels(container, container.primary_item)?;
+        if let Some(alpha) = alpha_item(container, container.primary_item) {
+            full_decode_pixels =
+                full_decode_pixels.saturating_add(full_item_pixels(container, alpha)?);
+        }
+        let output_pixels = (plan.output_width as u64).saturating_mul(plan.output_height as u64);
+        return Ok(source_bytes
+            .saturating_mul(FULL_DECODE_SOURCE_MULTIPLIER)
+            .saturating_add(full_decode_pixels.saturating_mul(FULL_DECODE_PIXEL_PEAK_BYTES))
+            .saturating_add(output_pixels.saturating_mul(OUTPUT_PIXEL_PEAK_BYTES)));
     }
     let item_ids = if plan.grid_streaming {
         container.referenced_items(plan.selected_item_id, b"dimg")
@@ -754,6 +760,42 @@ fn estimate_peak_bytes(
         .saturating_add(max_pixels.saturating_mul(CODED_PIXEL_PEAK_BYTES))
         .saturating_add(output_pixels.saturating_mul(OUTPUT_PIXEL_PEAK_BYTES))
         .saturating_add(max_payload.saturating_mul(2)))
+}
+
+fn full_item_pixels(container: &Container<'_>, item_id: u32) -> Result<u64, HeifError> {
+    let item = container
+        .items
+        .get(&item_id)
+        .ok_or_else(|| HeifError::Invalid(format!("image item {item_id} is missing")))?;
+    match &item.item_type {
+        b"hvc1" => full_coded_item_pixels(container, item_id),
+        b"grid" => {
+            let grid = parse_grid(container, item_id)?;
+            let tiles = container.referenced_items(item_id, b"dimg");
+            let tile_pixels = tiles.into_iter().try_fold(0_u64, |total, tile_id| {
+                full_coded_item_pixels(container, tile_id)
+                    .map(|pixels| total.saturating_add(pixels))
+            })?;
+            Ok(tile_pixels
+                .max((grid.output_width as u64).saturating_mul(grid.output_height as u64)))
+        }
+        other => Err(HeifError::UnsupportedCodec(crate::bytes::fourcc_str(
+            *other,
+        ))),
+    }
+}
+
+fn full_coded_item_pixels(container: &Container<'_>, item_id: u32) -> Result<u64, HeifError> {
+    let coded = item_coded_dimensions(container, item_id)?;
+    let declared = container
+        .find_property(item_id, |property| match property {
+            Property::Ispe { width, height } if *width != 0 && *height != 0 => {
+                Some((*width as usize, *height as usize))
+            }
+            _ => None,
+        })
+        .unwrap_or(coded);
+    Ok((coded.0.max(declared.0) as u64).saturating_mul(coded.1.max(declared.1) as u64))
 }
 
 fn item_coded_dimensions(
