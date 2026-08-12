@@ -20,6 +20,11 @@
 //! let rgba = image.to_rgba8();
 //! ```
 //!
+//! For target-sized output, [`decode_thumbnail_bytes`] first considers
+//! embedded `thmb` items, then decodes grid tiles sequentially into a scaled
+//! RGB canvas. [`thumbnail_info`] exposes the selected path and its
+//! conservative peak-memory estimate before pixel reconstruction.
+//!
 //! ## Limitations
 //!
 //! - Decode only — there is no pure-Rust HEVC encoder to pair with.
@@ -38,6 +43,7 @@ mod error;
 mod hevc;
 #[cfg(test)]
 pub(crate) mod test_builder;
+mod thumbnail;
 mod transform;
 
 use std::path::Path;
@@ -47,6 +53,7 @@ use color::{RgbBuffer, YuvImage};
 
 pub use color::Nclx;
 pub use error::HeifError;
+pub use thumbnail::{decode_thumbnail_bytes, thumbnail_info, ThumbnailDecodeInfo};
 
 /// Interleaved pixel data. 8-bit sources produce the `*8` variants; 10- and
 /// 12-bit sources produce `*16` (samples scaled to the full 0..65535 range).
@@ -256,7 +263,10 @@ fn decode_item_yuv(
 }
 
 /// Decode one `hvc1` coded item via rust_h265.
-fn decode_coded_item(container: &Container<'_>, item_id: u32) -> Result<YuvImage, HeifError> {
+pub(crate) fn decode_coded_item(
+    container: &Container<'_>,
+    item_id: u32,
+) -> Result<YuvImage, HeifError> {
     check_essential_properties(container, item_id)?;
     let hvcc_record = container
         .find_property(item_id, |p| match p {
@@ -354,7 +364,7 @@ fn decode_grid(
 
 /// Colour description for the decode: the primary item's `colr` if present,
 /// else the first grid tile's.
-fn collect_color_info(container: &Container<'_>, primary: u32) -> ColorInfo {
+pub(crate) fn collect_color_info(container: &Container<'_>, primary: u32) -> ColorInfo {
     let mut info = ColorInfo::default();
     let visit = |item_id: u32, info: &mut ColorInfo| {
         for (_, property) in container.item_properties(item_id) {

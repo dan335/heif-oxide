@@ -16,12 +16,28 @@ let rgba: Vec<u8> = image.to_rgba8();          // or…
 let f32s: Vec<f32> = image.to_f32_interleaved(); // 0.0..=1.0, native channels
 ```
 
+For thumbnails, use the target-sized path. It selects the smallest suitable
+embedded `thmb` item when one exists. Otherwise, grid tiles are decoded one at
+a time, scaled, colour-converted, and written directly into the small output
+canvas instead of assembling full-size YUV and RGB images:
+
+```rust
+let data = std::fs::read("photo.heic")?;
+let info = heif_oxide::thumbnail_info(&data, 256, 256)?;
+if info.estimated_peak_bytes <= 64 * 1024 * 1024 {
+    let thumbnail = heif_oxide::decode_thumbnail_bytes(&data, 256, 256)?;
+    assert!(thumbnail.width <= 256 && thumbnail.height <= 256);
+}
+```
+
 ## What works
 
 | Feature | Status |
 | --- | --- |
 | Single-picture `hvc1` items | ✅ |
 | Grid-tiled images (every iPhone photo) | ✅ tiles decoded in parallel |
+| Memory-conscious target-sized grid decode | ✅ sequential tiles, direct scaled output |
+| Embedded `thmb` image selection | ✅ smallest sufficient matching thumbnail |
 | 8-bit and 10-bit HEVC (Main / Main 10) | ✅ 10-bit → 16-bit output |
 | Orientation (`irot` / `imir` / `clap`) | ✅ applied in `ipma` order |
 | BT.601 / BT.709 / BT.2020 matrices, full & limited range | ✅ |
@@ -52,6 +68,13 @@ features listed above. Tested against real iPhone photos.
 Decoding is slower than libheif (the HEVC decoder is scalar pure Rust,
 roughly 5× slower than FFmpeg's) — a 12-megapixel iPhone photo takes on the
 order of a second, with grid tiles spread across cores.
+
+`decode_thumbnail_bytes` trades some of that parallelism for bounded peak
+memory. It still reconstructs one complete HEVC tile (or one complete coded
+image for non-grid files), because intra prediction requires neighbouring
+samples, but it does not retain multiple tiles or a full-resolution grid
+canvas. Non-MIAF transform ordering and images with alpha auxiliaries use the
+full decode as a correctness-preserving fallback.
 
 ## Testing
 

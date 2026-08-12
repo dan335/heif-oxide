@@ -293,3 +293,179 @@ fn conversion_helpers() {
     assert_eq!(rgba.len(), 64 * 64 * 4);
     assert_eq!(rgba[3], 255);
 }
+
+#[test]
+fn target_decode_prefers_a_sufficient_embedded_thumbnail() {
+    let (primary_hvcc, primary_payload) = fixture_item("flat_red_64");
+    let (thumbnail_hvcc, thumbnail_payload) = fixture_item("flat_green_64");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"hvc1",
+            payload: primary_payload,
+            props: vec![
+                (true, primary_hvcc),
+                (false, tb::ispe(64, 64)),
+                (false, nclx_601()),
+            ],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: thumbnail_payload,
+            props: vec![
+                (true, thumbnail_hvcc),
+                (false, tb::ispe(64, 64)),
+                (false, nclx_601()),
+            ],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"thmb", 2, vec![1])]);
+
+    let info = thumbnail_info(&file, 32, 32).expect("probe thumbnail");
+    assert_eq!(info.selected_item_id, 2);
+    assert!(info.used_embedded_thumbnail);
+    let image = decode_thumbnail_bytes(&file, 32, 32).expect("decode thumbnail");
+    assert_eq!((image.width, image.height), (32, 32));
+    let pixel = px(&image, 16, 16);
+    assert!(
+        pixel[1] > 200 && pixel[0] < 50 && pixel[2] < 50,
+        "{pixel:?}"
+    );
+}
+
+#[test]
+fn target_decode_streams_grid_tiles_into_the_scaled_canvas() {
+    let file = grid_heic("flat_red_64", "flat_blue_64", 100, 50, vec![]);
+
+    let info = thumbnail_info(&file, 20, 20).expect("probe thumbnail");
+    assert!(info.grid_streaming);
+    assert!(!info.has_container_orientation);
+    assert_eq!((info.output_width, info.output_height), (20, 10));
+    assert!(
+        info.estimated_peak_bytes < file.len() as u64 + 100 * 50 * 20,
+        "estimate {}",
+        info.estimated_peak_bytes
+    );
+    let image = decode_thumbnail_bytes(&file, 20, 20).expect("decode thumbnail");
+    assert_eq!((image.width, image.height), (20, 10));
+    assert!(is_reddish(px(&image, 2, 5)));
+    assert!(is_bluish(px(&image, 18, 5)));
+}
+
+#[test]
+fn target_probe_budgets_coded_sps_dimensions_not_only_ispe() {
+    let (hvcc, payload) = fixture_item("flat_red_64");
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload,
+        props: vec![(true, hvcc), (false, tb::ispe(1, 1))],
+    }];
+    let file = tb::make_heic(&items, 1, &[]);
+
+    let info = thumbnail_info(&file, 32, 32).expect("probe thumbnail");
+    assert!(
+        info.estimated_peak_bytes >= file.len() as u64 + 64 * 64 * 16,
+        "estimate {}",
+        info.estimated_peak_bytes
+    );
+}
+
+#[test]
+fn target_probe_budgets_the_primary_when_an_embedded_item_needs_full_fallback() {
+    let (primary_hvcc, primary_payload) = fixture_item("flat_red_64");
+    let (thumbnail_hvcc, thumbnail_payload) = fixture_item("flat_green_64");
+    let (alpha_hvcc, alpha_payload) = fixture_item("flat_gray_64");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"hvc1",
+            payload: primary_payload,
+            props: vec![(true, primary_hvcc), (false, tb::ispe(64, 64))],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: thumbnail_payload,
+            props: vec![(true, thumbnail_hvcc), (false, tb::ispe(1, 1))],
+        },
+        tb::TestItem {
+            id: 3,
+            item_type: *b"hvc1",
+            payload: alpha_payload,
+            props: vec![
+                (true, alpha_hvcc),
+                (
+                    false,
+                    tb::full_box(b"auxC", 0, 0, b"urn:mpeg:hevc:2015:auxid:1\0"),
+                ),
+            ],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"thmb", 2, vec![1]), (*b"auxl", 3, vec![2])]);
+
+    let info = thumbnail_info(&file, 1, 1).expect("probe fallback");
+    assert!(info.used_embedded_thumbnail);
+    assert!(
+        info.estimated_peak_bytes >= file.len() as u64 * 4 + 64 * 64 * 32,
+        "estimate {}",
+        info.estimated_peak_bytes
+    );
+}
+
+#[test]
+fn target_decode_skips_grid_tiles_outside_the_clean_aperture() {
+    let (left_hvcc, left_payload) = fixture_item("flat_red_64");
+    let (right_hvcc, mut right_payload) = fixture_item("flat_blue_64");
+    for byte in right_payload.iter_mut().skip(8) {
+        *byte ^= 0xA5;
+    }
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"grid",
+            payload: tb::grid_payload(1, 2, 128, 64),
+            props: vec![
+                (false, tb::ispe(128, 64)),
+                (false, nclx_601()),
+                (true, tb::clap(64, 64, -32, 0)),
+            ],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: left_payload,
+            props: vec![(true, left_hvcc), (false, tb::ispe(64, 64))],
+        },
+        tb::TestItem {
+            id: 3,
+            item_type: *b"hvc1",
+            payload: right_payload,
+            props: vec![(true, right_hvcc), (false, tb::ispe(64, 64))],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"dimg", 1, vec![2, 3])]);
+
+    let image = decode_thumbnail_bytes(&file, 32, 32).expect("decode cropped grid");
+    assert_eq!((image.width, image.height), (32, 32));
+    assert!(is_reddish(px(&image, 16, 16)));
+}
+
+#[test]
+fn target_decode_applies_orientation_after_scaling() {
+    let file = grid_heic(
+        "flat_red_64",
+        "flat_blue_64",
+        100,
+        50,
+        vec![(true, tb::irot(1))],
+    );
+
+    let info = thumbnail_info(&file, 20, 20).expect("probe oriented thumbnail");
+    assert!(info.has_container_orientation);
+    let image = decode_thumbnail_bytes(&file, 20, 20).expect("decode oriented thumbnail");
+    assert_eq!((image.width, image.height), (10, 20));
+    assert!(is_bluish(px(&image, 5, 2)));
+    assert!(is_reddish(px(&image, 5, 18)));
+}

@@ -161,6 +161,160 @@ pub enum RgbBuffer {
     Rgb16(Vec<u16>),
 }
 
+impl RgbBuffer {
+    pub fn black(width: usize, height: usize, bit_depth: u8) -> Self {
+        if bit_depth == 8 {
+            Self::Rgb8(vec![0; width * height * 3])
+        } else {
+            Self::Rgb16(vec![0; width * height * 3])
+        }
+    }
+
+    pub fn blit(
+        &mut self,
+        source: &Self,
+        source_width: usize,
+        x: usize,
+        y: usize,
+        destination_width: usize,
+    ) -> Result<(), HeifError> {
+        let source_height = match source {
+            Self::Rgb8(samples) => samples.len() / (source_width * 3),
+            Self::Rgb16(samples) => samples.len() / (source_width * 3),
+        };
+        match (self, source) {
+            (Self::Rgb8(destination), Self::Rgb8(source)) => {
+                for row in 0..source_height {
+                    let src = row * source_width * 3;
+                    let dst = ((y + row) * destination_width + x) * 3;
+                    destination[dst..dst + source_width * 3]
+                        .copy_from_slice(&source[src..src + source_width * 3]);
+                }
+            }
+            (Self::Rgb16(destination), Self::Rgb16(source)) => {
+                for row in 0..source_height {
+                    let src = row * source_width * 3;
+                    let dst = ((y + row) * destination_width + x) * 3;
+                    destination[dst..dst + source_width * 3]
+                        .copy_from_slice(&source[src..src + source_width * 3]);
+                }
+            }
+            _ => {
+                return Err(HeifError::Invalid(
+                    "grid tiles with mixed bit depths".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+struct ColorConverter {
+    kr: f32,
+    kb: f32,
+    kg: f32,
+    y_off: f32,
+    y_span: f32,
+    c_off: f32,
+    c_span: f32,
+    primaries_matrix: Option<[[f32; 3]; 3]>,
+}
+
+impl ColorConverter {
+    fn new(bit_depth: u8, nclx: &Nclx) -> Self {
+        let (kr, kb) = luma_weights(nclx.matrix);
+        let scale = (1u32 << (bit_depth - 8)) as f32;
+        let max = ((1u32 << bit_depth) - 1) as f32;
+        let (y_off, y_span, c_span) = if nclx.full_range {
+            (0.0, max, max)
+        } else {
+            (16.0 * scale, 219.0 * scale, 224.0 * scale)
+        };
+        let c_off = if nclx.full_range {
+            (1u32 << (bit_depth - 1)) as f32
+        } else {
+            128.0 * scale
+        };
+        Self {
+            kr,
+            kb,
+            kg: 1.0 - kr - kb,
+            y_off,
+            y_span,
+            c_off,
+            c_span,
+            primaries_matrix: primaries_to_srgb_matrix(nclx.primaries),
+        }
+    }
+
+    fn pixel(&self, image: &YuvImage, x: f32, y: f32) -> [f32; 3] {
+        let sample_plane = |plane: &[u16], width: usize, height: usize, x: f32, y: f32| {
+            let x = x.clamp(0.0, (width - 1) as f32);
+            let y = y.clamp(0.0, (height - 1) as f32);
+            let x0 = x.floor() as usize;
+            let x1 = (x0 + 1).min(width - 1);
+            let y0 = y.floor() as usize;
+            let y1 = (y0 + 1).min(height - 1);
+            let fx = x - x0 as f32;
+            let fy = y - y0 as f32;
+            let s00 = plane[y0 * width + x0] as f32;
+            let s01 = plane[y0 * width + x1] as f32;
+            let s10 = plane[y1 * width + x0] as f32;
+            let s11 = plane[y1 * width + x1] as f32;
+            s00 * (1.0 - fx) * (1.0 - fy)
+                + s01 * fx * (1.0 - fy)
+                + s10 * (1.0 - fx) * fy
+                + s11 * fx * fy
+        };
+        let chroma_width = image.chroma_width();
+        let chroma_height = image.chroma_height();
+        let chroma_x = (x / 2.0).clamp(0.0, (chroma_width - 1) as f32);
+        let chroma_y = ((y - 0.5) / 2.0).clamp(0.0, (chroma_height - 1) as f32);
+        let luma = ((sample_plane(&image.y, image.width, image.height, x, y) - self.y_off)
+            / self.y_span)
+            .clamp(0.0, 1.0);
+        let cb = (sample_plane(&image.u, chroma_width, chroma_height, chroma_x, chroma_y)
+            - self.c_off)
+            / self.c_span;
+        let cr = (sample_plane(&image.v, chroma_width, chroma_height, chroma_x, chroma_y)
+            - self.c_off)
+            / self.c_span;
+        let mut red = luma + 2.0 * (1.0 - self.kr) * cr;
+        let mut blue = luma + 2.0 * (1.0 - self.kb) * cb;
+        let mut green = (luma - self.kr * red - self.kb * blue) / self.kg;
+
+        if let Some(matrix) = &self.primaries_matrix {
+            let red_linear = srgb_to_linear(red.clamp(0.0, 1.0));
+            let green_linear = srgb_to_linear(green.clamp(0.0, 1.0));
+            let blue_linear = srgb_to_linear(blue.clamp(0.0, 1.0));
+            red = linear_to_srgb(
+                (matrix[0][0] * red_linear
+                    + matrix[0][1] * green_linear
+                    + matrix[0][2] * blue_linear)
+                    .clamp(0.0, 1.0),
+            );
+            green = linear_to_srgb(
+                (matrix[1][0] * red_linear
+                    + matrix[1][1] * green_linear
+                    + matrix[1][2] * blue_linear)
+                    .clamp(0.0, 1.0),
+            );
+            blue = linear_to_srgb(
+                (matrix[2][0] * red_linear
+                    + matrix[2][1] * green_linear
+                    + matrix[2][2] * blue_linear)
+                    .clamp(0.0, 1.0),
+            );
+        }
+
+        [
+            red.clamp(0.0, 1.0),
+            green.clamp(0.0, 1.0),
+            blue.clamp(0.0, 1.0),
+        ]
+    }
+}
+
 /// Kr/Kb luma weights for the supported matrix coefficients.
 fn luma_weights(matrix: u16) -> (f32, f32) {
     match matrix {
@@ -213,142 +367,98 @@ fn primaries_to_srgb_matrix(primaries: u16) -> Option<[[f32; 3]; 3]> {
 /// Row-parallel across available cores — a 12-megapixel conversion is a
 /// few hundred milliseconds single-threaded, which is worth splitting.
 pub fn yuv_to_rgb(img: &YuvImage, nclx: &Nclx) -> RgbBuffer {
-    let (kr, kb) = luma_weights(nclx.matrix);
-    let kg = 1.0 - kr - kb;
-    let scale = (1u32 << (img.bit_depth - 8)) as f32;
-    let max = ((1u32 << img.bit_depth) - 1) as f32;
-    let primaries_matrix = primaries_to_srgb_matrix(nclx.primaries);
+    yuv_to_rgb_scaled(
+        img, nclx, 0, 0, img.width, img.height, img.width, img.height,
+    )
+}
 
-    // Range expansion: limited range puts Y in [16..235]*2^(d-8) and chroma
-    // in [16..240]*2^(d-8); full range uses the whole code range.
-    let (y_off, y_span, c_span) = if nclx.full_range {
-        (0.0, max, max)
-    } else {
-        (16.0 * scale, 219.0 * scale, 224.0 * scale)
-    };
-    let c_off = if nclx.full_range {
-        // Full range centres chroma at 2^(d-1) exactly.
-        (1u32 << (img.bit_depth - 1)) as f32
-    } else {
-        128.0 * scale
-    };
+/// Convert and resample an integer source rectangle directly into an RGB
+/// output buffer. Only the requested output allocation is materialized.
+#[allow(clippy::too_many_arguments)]
+pub fn yuv_to_rgb_scaled(
+    img: &YuvImage,
+    nclx: &Nclx,
+    source_x: usize,
+    source_y: usize,
+    source_width: usize,
+    source_height: usize,
+    output_width: usize,
+    output_height: usize,
+) -> RgbBuffer {
+    debug_assert!(source_width > 0 && source_height > 0);
+    debug_assert!(output_width > 0 && output_height > 0);
+    debug_assert!(source_x + source_width <= img.width);
+    debug_assert!(source_y + source_height <= img.height);
 
-    let cw = img.chroma_width();
-    let ch = img.chroma_height();
-    let w = img.width;
+    let converter = ColorConverter::new(img.bit_depth, nclx);
     let is_8bit = img.bit_depth == 8;
     let mut out8 = if is_8bit {
-        vec![0u8; w * img.height * 3]
+        vec![0u8; output_width * output_height * 3]
     } else {
         Vec::new()
     };
     let mut out16 = if is_8bit {
         Vec::new()
     } else {
-        vec![0u16; w * img.height * 3]
+        vec![0u16; output_width * output_height * 3]
     };
 
-    // One closure converts a strip of rows [row_start, row_end) into the
-    // matching slice of the output buffer; threads each take a strip.
-    let convert_rows = |row_start: usize, rows8: &mut [u8], rows16: &mut [u16]| {
-        for (local_row, y_coord) in (row_start..).enumerate().take(if is_8bit {
-            rows8.len() / (w * 3)
+    let convert_rows = |output_row_start: usize, rows8: &mut [u8], rows16: &mut [u16]| {
+        let row_count = if is_8bit {
+            rows8.len() / (output_width * 3)
         } else {
-            rows16.len() / (w * 3)
-        }) {
-            // Vertical chroma position: samples are centred between luma
-            // rows, so luma row y maps to chroma coordinate (y - 0.5) / 2.
-            let cy = ((y_coord as f32 - 0.5) / 2.0).clamp(0.0, (ch - 1) as f32);
-            let cy0 = cy.floor() as usize;
-            let cy1 = (cy0 + 1).min(ch - 1);
-            let fy = cy - cy0 as f32;
-            for x in 0..w {
-                // Horizontal chroma position: co-sited left → chroma sample
-                // i sits at luma column 2i, so column x maps to x / 2.
-                let cx = (x as f32 / 2.0).clamp(0.0, (cw - 1) as f32);
-                let cx0 = cx.floor() as usize;
-                let cx1 = (cx0 + 1).min(cw - 1);
-                let fx = cx - cx0 as f32;
-
-                let sample = |plane: &[u16]| -> f32 {
-                    let s00 = plane[cy0 * cw + cx0] as f32;
-                    let s01 = plane[cy0 * cw + cx1] as f32;
-                    let s10 = plane[cy1 * cw + cx0] as f32;
-                    let s11 = plane[cy1 * cw + cx1] as f32;
-                    s00 * (1.0 - fx) * (1.0 - fy)
-                        + s01 * fx * (1.0 - fy)
-                        + s10 * (1.0 - fx) * fy
-                        + s11 * fx * fy
-                };
-
-                let yv = ((img.y[y_coord * w + x] as f32 - y_off) / y_span).clamp(0.0, 1.0);
-                let cb = (sample(&img.u) - c_off) / c_span;
-                let cr = (sample(&img.v) - c_off) / c_span;
-
-                // Standard YCbCr → R'G'B' from the Kr/Kb weights.
-                let mut r = yv + 2.0 * (1.0 - kr) * cr;
-                let mut b = yv + 2.0 * (1.0 - kb) * cb;
-                let mut g = (yv - kr * r - kb * b) / kg;
-
-                if let Some(m) = &primaries_matrix {
-                    // Convert wide-gamut primaries to sRGB through linear
-                    // light, clamping out-of-gamut results.
-                    let rl = srgb_to_linear(r.clamp(0.0, 1.0));
-                    let gl = srgb_to_linear(g.clamp(0.0, 1.0));
-                    let bl = srgb_to_linear(b.clamp(0.0, 1.0));
-                    r = linear_to_srgb(
-                        (m[0][0] * rl + m[0][1] * gl + m[0][2] * bl).clamp(0.0, 1.0),
-                    );
-                    g = linear_to_srgb(
-                        (m[1][0] * rl + m[1][1] * gl + m[1][2] * bl).clamp(0.0, 1.0),
-                    );
-                    b = linear_to_srgb(
-                        (m[2][0] * rl + m[2][1] * gl + m[2][2] * bl).clamp(0.0, 1.0),
-                    );
-                }
-
-                let i = local_row * w * 3 + x * 3;
+            rows16.len() / (output_width * 3)
+        };
+        for local_row in 0..row_count {
+            let output_y = output_row_start + local_row;
+            let input_y = source_y as f32
+                + ((output_y as f32 + 0.5) * source_height as f32 / output_height as f32 - 0.5)
+                    .clamp(0.0, (source_height - 1) as f32);
+            for output_x in 0..output_width {
+                let input_x = source_x as f32
+                    + ((output_x as f32 + 0.5) * source_width as f32 / output_width as f32 - 0.5)
+                        .clamp(0.0, (source_width - 1) as f32);
+                let [red, green, blue] = converter.pixel(img, input_x, input_y);
+                let index = local_row * output_width * 3 + output_x * 3;
                 if is_8bit {
-                    rows8[i] = (r.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                    rows8[i + 1] = (g.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                    rows8[i + 2] = (b.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    rows8[index] = (red * 255.0 + 0.5) as u8;
+                    rows8[index + 1] = (green * 255.0 + 0.5) as u8;
+                    rows8[index + 2] = (blue * 255.0 + 0.5) as u8;
                 } else {
-                    rows16[i] = (r.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
-                    rows16[i + 1] = (g.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
-                    rows16[i + 2] = (b.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                    rows16[index] = (red * 65535.0 + 0.5) as u16;
+                    rows16[index + 1] = (green * 65535.0 + 0.5) as u16;
+                    rows16[index + 2] = (blue * 65535.0 + 0.5) as u16;
                 }
             }
         }
     };
 
-    // Split the output into per-thread row strips and convert in parallel.
-    // The closure is shared by reference so each spawned thread can call it.
     let convert_rows = &convert_rows;
     let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(|count| count.get())
         .unwrap_or(1);
-    let rows_per_strip = ((img.height + threads - 1) / threads.max(1)).max(1);
+    let rows_per_strip = output_height.div_ceil(threads).max(1);
     if is_8bit {
-        let strips: Vec<(usize, &mut [u8])> = out8
-            .chunks_mut(rows_per_strip * w * 3)
+        let strips: Vec<_> = out8
+            .chunks_mut(rows_per_strip * output_width * 3)
             .enumerate()
-            .map(|(i, c)| (i * rows_per_strip, c))
+            .map(|(index, samples)| (index * rows_per_strip, samples))
             .collect();
-        std::thread::scope(|s| {
+        std::thread::scope(|scope| {
             for (row_start, strip) in strips {
-                s.spawn(move || convert_rows(row_start, strip, &mut []));
+                scope.spawn(move || convert_rows(row_start, strip, &mut []));
             }
         });
         RgbBuffer::Rgb8(out8)
     } else {
-        let strips: Vec<(usize, &mut [u16])> = out16
-            .chunks_mut(rows_per_strip * w * 3)
+        let strips: Vec<_> = out16
+            .chunks_mut(rows_per_strip * output_width * 3)
             .enumerate()
-            .map(|(i, c)| (i * rows_per_strip, c))
+            .map(|(index, samples)| (index * rows_per_strip, samples))
             .collect();
-        std::thread::scope(|s| {
+        std::thread::scope(|scope| {
             for (row_start, strip) in strips {
-                s.spawn(move || convert_rows(row_start, &mut [], strip));
+                scope.spawn(move || convert_rows(row_start, &mut [], strip));
             }
         });
         RgbBuffer::Rgb16(out16)
