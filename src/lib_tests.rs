@@ -221,6 +221,25 @@ fn decodes_alpha_auxiliary() {
     }
 }
 
+#[test]
+fn rejects_oversized_image_before_decoding() {
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload: vec![0; 16],
+        props: vec![(false, tb::ispe(65, 64))],
+    }];
+    assert!(matches!(
+        decode_bytes_with_limit(&tb::make_heic(&items, 1, &[]), (64, 64)),
+        Err(HeifError::ImageTooLarge {
+            width: 65,
+            height: 64,
+            max_width: 64,
+            max_height: 64,
+        })
+    ));
+}
+
 /// Non-HEVC primary items are rejected with the codec named.
 #[test]
 fn rejects_av01_item() {

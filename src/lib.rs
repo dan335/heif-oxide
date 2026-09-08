@@ -132,8 +132,34 @@ pub fn decode_file<P: AsRef<Path>>(path: P) -> Result<DecodedImage, HeifError> {
 
 /// Decode a HEIF/HEIC file already in memory.
 pub fn decode_bytes(data: &[u8]) -> Result<DecodedImage, HeifError> {
+    decode_bytes_inner(data, None)
+}
+
+/// Decode an in-memory HEIF/HEIC file whose dimensions must not exceed `max_size`.
+pub fn decode_bytes_with_limit(
+    data: &[u8],
+    max_size: (u32, u32),
+) -> Result<DecodedImage, HeifError> {
+    decode_bytes_inner(data, Some(max_size))
+}
+
+fn decode_bytes_inner(
+    data: &[u8],
+    max_size: Option<(u32, u32)>,
+) -> Result<DecodedImage, HeifError> {
     let container = boxes::parse(data)?;
     let primary = container.primary_item;
+    if let Some((max_width, max_height)) = max_size {
+        let (width, height) = declared_image_size(&container, primary)?;
+        if width > max_width || height > max_height {
+            return Err(HeifError::ImageTooLarge {
+                width,
+                height,
+                max_width,
+                max_height,
+            });
+        }
+    }
 
     // Decode the primary item to a YUV canvas (assembling grid tiles), plus
     // the declared output size the canvas is cropped to.
@@ -212,6 +238,31 @@ pub fn decode_bytes(data: &[u8]) -> Result<DecodedImage, HeifError> {
         pixels,
         color: color_info,
     })
+}
+
+fn declared_image_size(container: &Container<'_>, item_id: u32) -> Result<(u32, u32), HeifError> {
+    let info = container
+        .items
+        .get(&item_id)
+        .ok_or_else(|| HeifError::Invalid(format!("item {item_id} not in iinf")))?;
+    if &info.item_type == b"grid" {
+        let payload = container.item_payload(item_id)?;
+        let mut r = bytes::Reader::new(&payload, "grid item payload");
+        r.u8()?;
+        let flags = r.u8()?;
+        r.skip(2)?;
+        return if flags & 1 != 0 {
+            Ok((r.u32()?, r.u32()?))
+        } else {
+            Ok((r.u16()? as u32, r.u16()? as u32))
+        };
+    }
+    container
+        .find_property(item_id, |property| match property {
+            Property::Ispe { width, height } => Some((*width, *height)),
+            _ => None,
+        })
+        .ok_or_else(|| HeifError::Invalid(format!("image item {item_id} has no ispe property")))
 }
 
 /// Reject items that carry an *essential* property we don't understand —
