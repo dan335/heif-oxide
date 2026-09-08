@@ -17,6 +17,8 @@ use crate::error::HeifError;
 /// Brands (major or compatible) we accept in `ftyp`. Everything here stores
 /// still images with HEVC-decodable payloads or is the codec-agnostic
 /// structural brand (`mif1`); the actual codec check happens per-item.
+const MAX_ITEM_PAYLOAD_SIZE: usize = 256 * 1024 * 1024;
+
 const ACCEPTED_BRANDS: [&[u8; 4]; 8] = [
     b"heic", b"heix", b"heim", b"heis", // HEVC still image brands
     b"hevc", b"hevx", // HEVC image sequence brands (often listed as compatible)
@@ -201,24 +203,43 @@ impl<'a> Container<'a> {
                 )))
             }
         };
-        let mut payload = Vec::new();
+        let mut ranges = Vec::with_capacity(loc.extents.len());
+        let mut payload_len = 0usize;
         for &(offset, length) in &loc.extents {
-            let start = loc
-                .base_offset
-                .checked_add(offset)
-                .ok_or(HeifError::Truncated("iloc extent"))? as usize;
-            // extent_length 0 means "to the end of the source".
+            let start = usize::try_from(
+                loc.base_offset
+                    .checked_add(offset)
+                    .ok_or(HeifError::Truncated("iloc extent"))?,
+            )
+            .map_err(|_| HeifError::Truncated("iloc extent"))?;
             let end = if length == 0 {
                 source.len()
             } else {
                 start
-                    .checked_add(length as usize)
+                    .checked_add(
+                        usize::try_from(length).map_err(|_| HeifError::Truncated("iloc extent"))?,
+                    )
                     .ok_or(HeifError::Truncated("iloc extent"))?
             };
             if end > source.len() || start > end {
                 return Err(HeifError::Truncated("iloc extent"));
             }
-            payload.extend_from_slice(&source[start..end]);
+            payload_len = payload_len
+                .checked_add(end - start)
+                .filter(|&len| len <= MAX_ITEM_PAYLOAD_SIZE)
+                .ok_or_else(|| {
+                    HeifError::Invalid(format!(
+                        "item {item_id} payload exceeds {MAX_ITEM_PAYLOAD_SIZE} bytes"
+                    ))
+                })?;
+            ranges.push(start..end);
+        }
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(payload_len)
+            .map_err(|_| HeifError::Invalid(format!("item {item_id} payload is too large")))?;
+        for range in ranges {
+            payload.extend_from_slice(&source[range]);
         }
         Ok(payload)
     }
@@ -329,7 +350,13 @@ fn each_box(
                         fourcc_str(fourcc)
                     )));
                 }
-                (pos + 16, largesize as usize)
+                let box_size = usize::try_from(largesize).map_err(|_| {
+                    HeifError::Invalid(format!(
+                        "box '{}' largesize does not fit this platform",
+                        fourcc_str(fourcc)
+                    ))
+                })?;
+                (pos + 16, box_size)
             }
             s if (s as usize) < 8 => {
                 return Err(HeifError::Invalid(format!(
@@ -341,7 +368,7 @@ fn each_box(
         };
         let box_end = pos
             .checked_add(box_size)
-            .filter(|&e| e <= data.len())
+            .filter(|&e| e >= body_start && e <= data.len())
             .ok_or(HeifError::Truncated(context))?;
         f(fourcc, &data[body_start..box_end])?;
         pos = box_end;
