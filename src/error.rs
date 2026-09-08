@@ -41,6 +41,15 @@ pub enum HeifError {
     #[error("invalid HEIF structure: {0}")]
     Invalid(String),
 
+    /// The image dimensions exceed the caller's configured maximum.
+    #[error("image dimensions {width}x{height} exceed maximum {max_width}x{max_height}")]
+    ImageTooLarge {
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    },
+
     /// The HEVC codestream failed to decode, or decoded to something other
     /// than the size the container promised.
     #[error("HEVC decode failed: {0}")]

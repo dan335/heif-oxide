@@ -221,6 +221,99 @@ fn decodes_alpha_auxiliary() {
     }
 }
 
+#[test]
+fn rejects_amplifying_grids_before_decoding() {
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"grid",
+            payload: tb::grid_payload(1, 2, 128, 64),
+            props: vec![],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: vec![0; 16],
+            props: vec![],
+        },
+    ];
+    let duplicate_file = tb::make_heic(&items, 1, &[(*b"dimg", 1, vec![2, 2])]);
+    assert!(matches!(
+        decode_bytes(&duplicate_file),
+        Err(HeifError::Invalid(message)) if message.contains("duplicate tile")
+    ));
+
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"grid",
+        payload: tb::grid_payload(33, 33, 1, 1),
+        props: vec![],
+    }];
+    assert!(matches!(
+        decode_bytes(&tb::make_heic(&items, 1, &[])),
+        Err(HeifError::Invalid(message)) if message.contains("maximum is 1024")
+    ));
+
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"grid",
+            payload: tb::grid_payload(1, 2, 1, 1),
+            props: vec![],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: vec![0; 16],
+            props: vec![(false, tb::ispe(10_000, 10_000))],
+        },
+        tb::TestItem {
+            id: 3,
+            item_type: *b"hvc1",
+            payload: vec![0; 16],
+            props: vec![(false, tb::ispe(10_000, 10_000))],
+        },
+    ];
+    let oversized_tiles = tb::make_heic(&items, 1, &[(*b"dimg", 1, vec![2, 3])]);
+    assert!(matches!(
+        decode_bytes(&oversized_tiles),
+        Err(HeifError::Invalid(message)) if message.contains("tile images exceed")
+    ));
+}
+
+#[test]
+fn rejects_excessive_transforms_before_decoding() {
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload: vec![0; 16],
+        props: (0..5).map(|_| (false, tb::irot(1))).collect(),
+    }];
+    assert!(matches!(
+        decode_bytes(&tb::make_heic(&items, 1, &[])),
+        Err(HeifError::Invalid(message)) if message.contains("5 transforms")
+    ));
+}
+
+#[test]
+fn rejects_oversized_image_before_decoding() {
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload: vec![0; 16],
+        props: vec![(false, tb::ispe(65, 64))],
+    }];
+    assert!(matches!(
+        decode_bytes_with_limit(&tb::make_heic(&items, 1, &[]), (64, 64)),
+        Err(HeifError::ImageTooLarge {
+            width: 65,
+            height: 64,
+            max_width: 64,
+            max_height: 64,
+        })
+    ));
+}
+
 /// Non-HEVC primary items are rejected with the codec named.
 #[test]
 fn rejects_av01_item() {

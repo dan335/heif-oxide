@@ -154,6 +154,56 @@ fn truncation_never_panics() {
     }
 }
 
+#[test]
+fn rejects_amplified_iloc_payload() {
+    let data = vec![0u8; 4097];
+    let mut items = HashMap::new();
+    items.insert(
+        1,
+        ItemInfo {
+            item_type: *b"hvc1",
+            protection_index: 0,
+        },
+    );
+    let mut locations = HashMap::new();
+    locations.insert(
+        1,
+        ItemLocation {
+            construction_method: 0,
+            data_reference_index: 0,
+            base_offset: 0,
+            extents: vec![(0, 0); u16::MAX as usize],
+        },
+    );
+    let container = Container {
+        data: &data,
+        primary_item: 1,
+        items,
+        locations,
+        idat: None,
+        properties: Vec::new(),
+        associations: HashMap::new(),
+        references: Vec::new(),
+    };
+    assert!(matches!(
+        container.item_payload(1),
+        Err(HeifError::Invalid(message)) if message.contains("payload exceeds")
+    ));
+}
+
+#[test]
+fn rejects_unaddressable_large_box_size() {
+    let mut data = Vec::new();
+    data.extend_from_slice(&1u32.to_be_bytes());
+    data.extend_from_slice(b"free");
+    data.extend_from_slice(&u64::MAX.to_be_bytes());
+    let error = each_box(&data, "test", &mut |_, _| Ok(())).unwrap_err();
+    assert!(matches!(
+        error,
+        HeifError::Invalid(_) | HeifError::Truncated(_)
+    ));
+}
+
 /// iloc construction_method 1 reads payload bytes out of `idat`.
 #[test]
 fn reads_idat_payloads() {
