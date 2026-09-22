@@ -321,36 +321,51 @@ pub fn yuv_to_rgb(img: &YuvImage, nclx: &Nclx) -> RgbBuffer {
         }
     };
 
-    // Split the output into per-thread row strips and convert in parallel.
-    // The closure is shared by reference so each spawned thread can call it.
-    let convert_rows = &convert_rows;
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let rows_per_strip = ((img.height + threads - 1) / threads.max(1)).max(1);
     if is_8bit {
-        let strips: Vec<(usize, &mut [u8])> = out8
-            .chunks_mut(rows_per_strip * w * 3)
-            .enumerate()
-            .map(|(i, c)| (i * rows_per_strip, c))
-            .collect();
-        std::thread::scope(|s| {
-            for (row_start, strip) in strips {
-                s.spawn(move || convert_rows(row_start, strip, &mut []));
-            }
-        });
+        #[cfg(target_family = "wasm")]
+        convert_rows(0, &mut out8, &mut []);
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let convert_rows = &convert_rows;
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let rows_per_strip = ((img.height + threads - 1) / threads.max(1)).max(1);
+            let strips: Vec<(usize, &mut [u8])> = out8
+                .chunks_mut(rows_per_strip * w * 3)
+                .enumerate()
+                .map(|(i, c)| (i * rows_per_strip, c))
+                .collect();
+            std::thread::scope(|s| {
+                for (row_start, strip) in strips {
+                    s.spawn(move || convert_rows(row_start, strip, &mut []));
+                }
+            });
+        }
         RgbBuffer::Rgb8(out8)
     } else {
-        let strips: Vec<(usize, &mut [u16])> = out16
-            .chunks_mut(rows_per_strip * w * 3)
-            .enumerate()
-            .map(|(i, c)| (i * rows_per_strip, c))
-            .collect();
-        std::thread::scope(|s| {
-            for (row_start, strip) in strips {
-                s.spawn(move || convert_rows(row_start, &mut [], strip));
-            }
-        });
+        #[cfg(target_family = "wasm")]
+        convert_rows(0, &mut [], &mut out16);
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let convert_rows = &convert_rows;
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let rows_per_strip = ((img.height + threads - 1) / threads.max(1)).max(1);
+            let strips: Vec<(usize, &mut [u16])> = out16
+                .chunks_mut(rows_per_strip * w * 3)
+                .enumerate()
+                .map(|(i, c)| (i * rows_per_strip, c))
+                .collect();
+            std::thread::scope(|s| {
+                for (row_start, strip) in strips {
+                    s.spawn(move || convert_rows(row_start, &mut [], strip));
+                }
+            });
+        }
         RgbBuffer::Rgb16(out16)
     }
 }

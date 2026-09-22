@@ -302,31 +302,38 @@ fn decode_grid(
         )));
     }
 
-    // Decode all tiles, splitting the list across the available cores —
-    // each tile is an independent HEVC codestream. Results land in a
-    // pre-sized Vec via disjoint per-thread chunks (no locking).
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let chunk_size = tiles.len().div_ceil(threads).max(1);
-    let mut results: Vec<Option<Result<YuvImage, HeifError>>> = Vec::new();
-    results.resize_with(tiles.len(), || None);
-    std::thread::scope(|s| {
-        for (tile_chunk, result_chunk) in
-            tiles.chunks(chunk_size).zip(results.chunks_mut(chunk_size))
-        {
-            s.spawn(move || {
-                for (tile_id, slot) in tile_chunk.iter().zip(result_chunk.iter_mut()) {
-                    *slot = Some(decode_coded_item(container, *tile_id));
-                }
-            });
-        }
-    });
+    #[cfg(target_family = "wasm")]
+    let decoded = tiles
+        .iter()
+        .map(|tile_id| decode_coded_item(container, *tile_id))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    let mut decoded = Vec::with_capacity(tiles.len());
-    for slot in results {
-        decoded.push(slot.expect("every tile chunk was processed")?);
-    }
+    #[cfg(not(target_family = "wasm"))]
+    let decoded = {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = tiles.len().div_ceil(threads).max(1);
+        let mut results: Vec<Option<Result<YuvImage, HeifError>>> = Vec::new();
+        results.resize_with(tiles.len(), || None);
+        std::thread::scope(|s| {
+            for (tile_chunk, result_chunk) in
+                tiles.chunks(chunk_size).zip(results.chunks_mut(chunk_size))
+            {
+                s.spawn(move || {
+                    for (tile_id, slot) in tile_chunk.iter().zip(result_chunk.iter_mut()) {
+                        *slot = Some(decode_coded_item(container, *tile_id));
+                    }
+                });
+            }
+        });
+
+        let mut decoded = Vec::with_capacity(tiles.len());
+        for slot in results {
+            decoded.push(slot.expect("every tile chunk was processed")?);
+        }
+        decoded
+    };
 
     // All tiles must agree on geometry; the canvas is a whole number of
     // tiles, cropped to (out_w, out_h) later in RGB space.
