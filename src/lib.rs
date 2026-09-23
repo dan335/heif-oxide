@@ -68,6 +68,21 @@ pub struct ColorInfo {
     pub icc_present: bool,
 }
 
+/// Basic information about a HEIF image, read without decoding its pixels.
+#[derive(Debug, Clone)]
+pub struct ImageMetadata {
+    /// Display width after clean-aperture and orientation transforms.
+    pub width: u32,
+    /// Display height after clean-aperture and orientation transforms.
+    pub height: u32,
+    /// Source bits per color sample, normally 8, 10, or 12.
+    pub bit_depth: u8,
+    /// Whether the container declares an alpha auxiliary image.
+    pub has_alpha: bool,
+    /// The container's declared color information.
+    pub color: ColorInfo,
+}
+
 /// A decoded HEIF image: display-ready sRGB with orientation applied.
 pub struct DecodedImage {
     pub width: u32,
@@ -128,6 +143,78 @@ impl DecodedImage {
 /// Decode a HEIF/HEIC file from disk.
 pub fn decode_file<P: AsRef<Path>>(path: P) -> Result<DecodedImage, HeifError> {
     decode_bytes(&std::fs::read(path)?)
+}
+
+/// Read basic image metadata without decoding the HEVC pixel data.
+pub fn read_metadata(data: &[u8]) -> Result<ImageMetadata, HeifError> {
+    let container = boxes::parse(data)?;
+    let primary = container.primary_item;
+    check_essential_properties(&container, primary)?;
+
+    let (mut width, mut height) = declared_image_size(&container, primary)?;
+    for (_, property) in container.item_properties(primary) {
+        match property {
+            Property::Clap {
+                width_n,
+                width_d,
+                height_n,
+                height_d,
+                ..
+            } => {
+                if *width_d == 0 || *height_d == 0 {
+                    return Err(HeifError::Invalid(
+                        "clean aperture has a zero denominator".into(),
+                    ));
+                }
+                let crop_width = (f64::from(*width_n) / f64::from(*width_d)).round() as u32;
+                let crop_height = (f64::from(*height_n) / f64::from(*height_d)).round() as u32;
+                if crop_width == 0 || crop_height == 0 || crop_width > width || crop_height > height
+                {
+                    return Err(HeifError::Invalid(format!(
+                        "clean aperture {crop_width}x{crop_height} outside image {width}x{height}"
+                    )));
+                }
+                width = crop_width;
+                height = crop_height;
+            }
+            Property::Irot { angle } if angle % 2 == 1 => {
+                std::mem::swap(&mut width, &mut height);
+            }
+            _ => {}
+        }
+    }
+
+    let coded_item = match container.items.get(&primary) {
+        Some(info) if &info.item_type == b"hvc1" => primary,
+        Some(info) if &info.item_type == b"grid" => container
+            .referenced_items(primary, b"dimg")
+            .into_iter()
+            .next()
+            .ok_or_else(|| HeifError::Invalid("grid has no tile references".into()))?,
+        Some(info) => {
+            return Err(HeifError::UnsupportedCodec(bytes::fourcc_str(
+                info.item_type,
+            )))
+        }
+        None => return Err(HeifError::Invalid(format!("item {primary} not in iinf"))),
+    };
+    check_essential_properties(&container, coded_item)?;
+    let bit_depth = container
+        .find_property(coded_item, |property| match property {
+            Property::HvcC(record) => Some(hevc::hvcc_bit_depth(record)),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            HeifError::Invalid(format!("coded item {coded_item} has no hvcC property"))
+        })??;
+
+    Ok(ImageMetadata {
+        width,
+        height,
+        bit_depth,
+        has_alpha: find_alpha_item(&container, primary).is_some(),
+        color: collect_color_info(&container, primary),
+    })
 }
 
 /// Decode a HEIF/HEIC file already in memory.
@@ -212,6 +299,31 @@ pub fn decode_bytes(data: &[u8]) -> Result<DecodedImage, HeifError> {
         pixels,
         color: color_info,
     })
+}
+
+fn declared_image_size(container: &Container<'_>, item_id: u32) -> Result<(u32, u32), HeifError> {
+    let info = container
+        .items
+        .get(&item_id)
+        .ok_or_else(|| HeifError::Invalid(format!("item {item_id} not in iinf")))?;
+    if &info.item_type == b"grid" {
+        let payload = container.item_payload(item_id)?;
+        let mut r = bytes::Reader::new(&payload, "grid item payload");
+        r.u8()?;
+        let flags = r.u8()?;
+        r.skip(2)?;
+        return if flags & 1 != 0 {
+            Ok((r.u32()?, r.u32()?))
+        } else {
+            Ok((r.u16()? as u32, r.u16()? as u32))
+        };
+    }
+    container
+        .find_property(item_id, |property| match property {
+            Property::Ispe { width, height } => Some((*width, *height)),
+            _ => None,
+        })
+        .ok_or_else(|| HeifError::Invalid(format!("image item {item_id} has no ispe property")))
 }
 
 /// Reject items that carry an *essential* property we don't understand —
@@ -389,32 +501,35 @@ fn collect_color_info(container: &Container<'_>, primary: u32) -> ColorInfo {
     info
 }
 
+fn find_alpha_item(container: &Container<'_>, primary: u32) -> Option<u32> {
+    container
+        .references
+        .iter()
+        .find(|reference| {
+            &reference.ref_type == b"auxl"
+                && reference.to_items.contains(&primary)
+                && container
+                    .find_property(reference.from_item, |property| match property {
+                        Property::AuxC(urn) => {
+                            Some(urn.contains("alpha") || urn == "urn:mpeg:hevc:2015:auxid:1")
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(false)
+        })
+        .map(|reference| reference.from_item)
+}
+
 /// Try to decode an alpha auxiliary image into a u16 plane (full-scale
-/// 0..65535) matching the master's pre-transform output size. Any failure —
-/// including the common monochrome-HEVC alpha rust_h265 can't decode —
-/// returns `None` and the image ships without alpha.
+/// 0..65535) matching the master's pre-transform output size.
 fn decode_alpha_plane(
     container: &Container<'_>,
     primary: u32,
     out_w: usize,
     out_h: usize,
 ) -> Option<Vec<u16>> {
-    // An alpha auxiliary points AT the image it augments: find an item
-    // whose `auxl` reference targets the primary and whose auxC URN says
-    // it's alpha.
-    let aux_item = container.references.iter().find(|r| {
-        &r.ref_type == b"auxl"
-            && r.to_items.contains(&primary)
-            && container
-                .find_property(r.from_item, |p| match p {
-                    Property::AuxC(urn) => {
-                        Some(urn.contains("alpha") || urn == "urn:mpeg:hevc:2015:auxid:1")
-                    }
-                    _ => None,
-                })
-                .unwrap_or(false)
-    })?;
-    let (yuv, aux_w, aux_h) = decode_item_yuv(container, aux_item.from_item).ok()?;
+    let aux_item = find_alpha_item(container, primary)?;
+    let (yuv, aux_w, aux_h) = decode_item_yuv(container, aux_item).ok()?;
     if aux_w != out_w || aux_h != out_h {
         return None;
     }

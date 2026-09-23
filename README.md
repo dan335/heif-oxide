@@ -16,6 +16,14 @@ let rgba: Vec<u8> = image.to_rgba8();          // or…
 let f32s: Vec<f32> = image.to_f32_interleaved(); // 0.0..=1.0, native channels
 ```
 
+Read dimensions, source bit depth, color information, and alpha presence without decoding pixels:
+
+```rust
+let data = std::fs::read("photo.heic")?;
+let metadata = heif_oxide::read_metadata(&data)?;
+println!("{}x{}, {}-bit", metadata.width, metadata.height, metadata.bit_depth);
+```
+
 ## What works
 
 | Feature | Status |
