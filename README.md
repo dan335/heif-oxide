@@ -56,9 +56,8 @@ features listed above. Tested against real iPhone photos.
 
 The HEVC decoder is pure Rust. Its own benchmarks put `rust_h265` 0.4 at
 roughly 1.5× slower than single-threaded FFmpeg on 8-bit video, and faster
-on 10-bit. Moving from `rust_h265` 0.1 to 0.4 made decoding the
-conformance files about 1.3× faster end to end. A 12-megapixel iPhone
-photo takes on the order of a second, with grid tiles spread across cores.
+on 10-bit. A 12-megapixel iPhone photo takes on the order of a second, with
+grid tiles spread across cores.
 
 ## Testing
 
