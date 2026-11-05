@@ -24,7 +24,7 @@ fn as_rgb8(buf: RgbBuffer) -> Vec<u8> {
 }
 
 fn assert_flat_rgb(buf: &[u8], expected: [u8; 3], tolerance: i16) {
-    for px in buf.chunks_exact(3) {
+    for px in buf.as_chunks::<3>().0 {
         for c in 0..3 {
             let diff = (px[c] as i16 - expected[c] as i16).abs();
             assert!(
