@@ -85,6 +85,14 @@ impl YuvImage {
     /// Wrap a decoded `rust_h265::Frame`, normalizing both storage widths to
     /// u16 and validating the plane sizes the container promised.
     pub fn from_frame(frame: &Frame) -> Result<Self, HeifError> {
+        // rust_h265 also decodes 4:4:4 (`chroma_format_idc` 3), but the
+        // canvas, blit and colour conversion below are 4:2:0-only.
+        if frame.chroma_format_idc != 1 {
+            return Err(HeifError::Unsupported(format!(
+                "HEVC chroma_format_idc {} (only 4:2:0 is supported)",
+                frame.chroma_format_idc
+            )));
+        }
         let width = frame.width as usize;
         let height = frame.height as usize;
         let cw = width.div_ceil(2);
@@ -120,7 +128,7 @@ impl YuvImage {
     /// the 4:2:0 chroma grids stay aligned — grid tiling guarantees this
     /// for every sane file (tile offsets are multiples of the tile size).
     pub fn blit(&mut self, tile: &YuvImage, x: usize, y: usize) -> Result<(), HeifError> {
-        if x % 2 != 0 || y % 2 != 0 {
+        if !x.is_multiple_of(2) || !y.is_multiple_of(2) {
             return Err(HeifError::Unsupported(
                 "grid tiles at odd offsets (chroma grids misaligned)".into(),
             ));

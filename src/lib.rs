@@ -25,7 +25,9 @@
 //! - Decode only — there is no pure-Rust HEVC encoder to pair with.
 //! - Alpha auxiliary images are decoded when they are 4:2:0-coded; the more
 //!   common monochrome (4:0:0) alpha is skipped (the underlying HEVC
-//!   decoder is 4:2:0-only), yielding an image without alpha.
+//!   decoder does not support monochrome), yielding an image without alpha.
+//! - 4:4:4 streams are rejected: rust_h265 decodes them, but this crate's
+//!   colour pipeline is 4:2:0-only.
 //! - AVIF (`av01` payloads) and JPEG-in-HEIF are rejected with a clear
 //!   error, as are protected items and externally-referenced data.
 //! - HDR transfer functions (PQ/HLG) are not tone-mapped; wide-gamut
@@ -107,14 +109,14 @@ impl DecodedImage {
         let mut out = Vec::with_capacity(n * 4);
         match &self.pixels {
             Pixels::Rgb8(v) => {
-                for px in v.chunks_exact(3) {
+                for px in v.as_chunks::<3>().0 {
                     out.extend_from_slice(px);
                     out.push(255);
                 }
             }
             Pixels::Rgba8(v) => out.extend_from_slice(v),
             Pixels::Rgb16(v) => {
-                for px in v.chunks_exact(3) {
+                for px in v.as_chunks::<3>().0 {
                     out.extend(px.iter().map(|&s| (s >> 8) as u8));
                     out.push(255);
                 }
@@ -433,7 +435,7 @@ fn decode_alpha_plane(
 /// Interleave a u16 alpha plane into an 8-bit RGB buffer.
 fn interleave_alpha8(rgb: &[u8], alpha: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
-    for (px, &a) in rgb.chunks_exact(3).zip(alpha.iter()) {
+    for (px, &a) in rgb.as_chunks::<3>().0.iter().zip(alpha.iter()) {
         out.extend_from_slice(px);
         out.push((a >> 8) as u8);
     }
@@ -443,7 +445,7 @@ fn interleave_alpha8(rgb: &[u8], alpha: &[u16]) -> Vec<u8> {
 /// Interleave a u16 alpha plane into a 16-bit RGB buffer.
 fn interleave_alpha16(rgb: &[u16], alpha: &[u16]) -> Vec<u16> {
     let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
-    for (px, &a) in rgb.chunks_exact(3).zip(alpha.iter()) {
+    for (px, &a) in rgb.as_chunks::<3>().0.iter().zip(alpha.iter()) {
         out.extend_from_slice(px);
         out.push(a);
     }

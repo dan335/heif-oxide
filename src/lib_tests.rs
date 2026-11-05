@@ -22,7 +22,7 @@ fn assert_flat_rgb8(image: &DecodedImage, expected: [u8; 3], tolerance: i16) {
         panic!("expected Rgb8 pixels");
     };
     assert_eq!(buf.len(), (image.width * image.height * 3) as usize);
-    for px in buf.chunks_exact(3) {
+    for px in buf.as_chunks::<3>().0 {
         for c in 0..3 {
             assert!(
                 (px[c] as i16 - expected[c] as i16).abs() <= tolerance,
@@ -215,7 +215,7 @@ fn decodes_alpha_auxiliary() {
         panic!("expected Rgba8");
     };
     // Alpha = luma 128 read full-range → 128; colour channels still red.
-    for p in buf.chunks_exact(4) {
+    for p in buf.as_chunks::<4>().0 {
         assert!((p[0] as i16 - 254).abs() <= 1 && p[1] <= 1 && p[2] <= 1);
         assert!((p[3] as i16 - 128).abs() <= 1, "alpha {}", p[3]);
     }
@@ -267,6 +267,16 @@ fn corrupt_payload_is_an_error() {
         props: vec![(true, hvcc)],
     }];
     assert!(decode_bytes(&tb::make_heic(&items, 1, &[])).is_err());
+}
+
+/// A 4:4:4 codestream decodes in rust_h265 but is rejected cleanly here
+/// (the colour pipeline is 4:2:0-only).
+#[test]
+fn rejects_444_chroma() {
+    match decode_bytes(&single_item_heic("flat_red_64_444")) {
+        Err(HeifError::Unsupported(msg)) => assert!(msg.contains("chroma_format_idc 3"), "{msg}"),
+        other => panic!("expected Unsupported, got {:?}", other.err()),
+    }
 }
 
 /// Not a test: writes a small complete `.heic` (the flat-red codestream in
