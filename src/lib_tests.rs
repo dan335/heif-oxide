@@ -353,6 +353,73 @@ fn rejects_444_chroma() {
     }
 }
 
+/// `flat_full_range_64` is a flat Y=60 Cb=110 Cr=160 picture whose SPS VUI
+/// signals what an iPhone writes: full range, BT.601 matrix, Display P3
+/// primaries. Decoded with that description it is this sRGB colour; with
+/// the limited-range BT.709 defaults it would be [109, 38, 13].
+const FULL_RANGE_P3_RGB: [u8; 3] = [114, 38, 22];
+
+/// A file with no `colr` nclx box takes range, matrix and primaries from
+/// the bitstream's VUI instead of assuming limited-range BT.709.
+#[test]
+fn bitstream_colour_is_used_without_nclx() {
+    let (hvcc, payload) = fixture_item("flat_full_range_64");
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload,
+        props: vec![(true, hvcc), (false, tb::ispe(64, 64))],
+    }];
+    let image = decode_bytes(&tb::make_heic(&items, 1, &[])).expect("decode");
+    assert_flat_rgb8(&image, FULL_RANGE_P3_RGB, 1);
+    // `color.nclx` reports the container, which declared nothing.
+    assert!(image.color.nclx.is_none());
+}
+
+/// The iPhone layout: a grid whose only `colr` is an ICC profile. The
+/// tiles' VUI still drives the conversion.
+#[test]
+fn bitstream_colour_is_used_for_grid_with_icc_only() {
+    let (hvcc_l, payload_l) = fixture_item("flat_full_range_64");
+    let (hvcc_r, payload_r) = fixture_item("flat_full_range_64");
+    let icc = tb::plain_box(b"colr", b"prof\0\0\0\0");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"grid",
+            payload: tb::grid_payload(1, 2, 100, 50),
+            props: vec![(false, tb::ispe(100, 50)), (false, icc)],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: payload_l,
+            props: vec![(true, hvcc_l), (false, tb::ispe(64, 64))],
+        },
+        tb::TestItem {
+            id: 3,
+            item_type: *b"hvc1",
+            payload: payload_r,
+            props: vec![(true, hvcc_r), (false, tb::ispe(64, 64))],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"dimg", 1, vec![2, 3])]);
+    let image = decode_bytes(&file).expect("decode");
+    assert_eq!((image.width, image.height), (100, 50));
+    assert_flat_rgb8(&image, FULL_RANGE_P3_RGB, 1);
+    assert!(image.color.icc_present);
+    assert!(image.color.nclx.is_none());
+}
+
+/// A container nclx box, when present, wins over the bitstream's VUI.
+#[test]
+fn container_nclx_overrides_bitstream_colour() {
+    // single_item_heic attaches a limited-range BT.601 sRGB nclx.
+    let image = decode_bytes(&single_item_heic("flat_full_range_64")).expect("decode");
+    assert_flat_rgb8(&image, [102, 32, 15], 1);
+    assert!(image.color.nclx.is_some());
+}
+
 /// Not a test: writes a small complete `.heic` (the flat-red codestream in
 /// a single-item container) to `testdata/` for downstream consumers that
 /// want a committed end-to-end fixture. Run explicitly with

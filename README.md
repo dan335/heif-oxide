@@ -35,6 +35,7 @@ println!("{}x{}, {}-bit", metadata.width, metadata.height, metadata.bit_depth);
 | 8-bit and 10-bit HEVC (Main / Main 10) | ✅ 10-bit → 16-bit output |
 | Orientation (`irot` / `imir` / `clap`) | ✅ applied in `ipma` order |
 | BT.601 / BT.709 / BT.2020 matrices, full & limited range | ✅ |
+| Colour signalling from `colr` nclx, else the HEVC bitstream (SPS VUI) | ✅ iPhone photos carry only the latter |
 | Display P3 → sRGB conversion (iPhone default) | ✅ linear-light 3×3 |
 | Alpha auxiliary images | ⚠️ only when 4:2:0-coded (monochrome alpha needs a 4:0:0 decoder) |
 | `idat`-stored payloads, multi-extent items | ✅ |

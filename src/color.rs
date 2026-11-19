@@ -3,7 +3,8 @@
 //! Decoded HEVC frames arrive as planar YCbCr 4:2:0 (8- or 10/12-bit). This
 //! module holds them in a uniform u16-plane representation (so grid tiles can
 //! be blitted into one canvas regardless of storage width), then converts to
-//! interleaved RGB using the `colr`/nclx colour description:
+//! interleaved RGB using the `colr`/nclx colour description (or, when the
+//! container has none, the equivalent fields from the HEVC SPS VUI):
 //!
 //! - matrix coefficients (BT.601 / BT.709 / BT.2020) and full/limited range
 //!   select the YCbCr→R'G'B' math;

@@ -38,6 +38,7 @@ mod bytes;
 mod color;
 mod error;
 mod hevc;
+mod sps;
 #[cfg(test)]
 pub(crate) mod test_builder;
 mod transform;
@@ -64,7 +65,10 @@ pub enum Pixels {
 /// what conversions were applied. Pixels are always delivered as sRGB.
 #[derive(Debug, Clone, Default)]
 pub struct ColorInfo {
-    /// The `colr` nclx description, if present.
+    /// The `colr` nclx description, if present. When it is absent the
+    /// decoder falls back to the colour signalling inside the HEVC
+    /// bitstream (the SPS VUI), and only then to its defaults (BT.709
+    /// matrix, limited range, sRGB primaries).
     pub nclx: Option<Nclx>,
     /// An ICC profile was present (noted, not applied).
     pub icc_present: bool,
@@ -229,9 +233,12 @@ pub fn decode_bytes(data: &[u8]) -> Result<DecodedImage, HeifError> {
     let (yuv, out_w, out_h) = decode_item_yuv(&container, primary)?;
 
     // Colour description: the primary (grid) item's colr wins; tiles may
-    // carry their own — used as fallback.
+    // carry their own — used as fallback. Without any nclx box, the coded
+    // picture's own VUI signalling decides.
     let color_info = collect_color_info(&container, primary);
-    let nclx = color_info.nclx.unwrap_or_default();
+    let nclx = color_info
+        .nclx
+        .unwrap_or_else(|| bitstream_nclx(&container, primary));
 
     let rgb = color::yuv_to_rgb(&yuv, &nclx);
 
@@ -527,6 +534,62 @@ fn find_alpha_item(container: &Container<'_>, primary: u32) -> Option<u32> {
                     .unwrap_or(false)
         })
         .map(|reference| reference.from_item)
+}
+
+/// Colour description for a file with no `colr` nclx box: whatever the
+/// coded picture's SPS VUI signals (H.265 §E.2.1), over the defaults.
+///
+/// iPhone photos are the common case — they carry an ICC profile instead of
+/// nclx, and their bitstream says full range, BT.601 matrix, Display P3
+/// primaries. Treating them as the limited-range default crushes shadows
+/// and clips highlights.
+///
+/// Best-effort: a missing or unparseable SPS leaves the defaults in place.
+fn bitstream_nclx(container: &Container<'_>, primary: u32) -> Nclx {
+    /// CICP code point meaning "unspecified" — carries no information.
+    const UNSPECIFIED: u8 = 2;
+
+    let mut nclx = Nclx::default();
+    // The coded picture is the primary item itself, or — for a grid — its
+    // first tile (tiles of one grid share their coding parameters).
+    let coded_item = match container.items.get(&primary) {
+        Some(info) if &info.item_type == b"grid" => container
+            .referenced_items(primary, b"dimg")
+            .first()
+            .copied(),
+        Some(_) => Some(primary),
+        None => None,
+    };
+    let vui = coded_item
+        .and_then(|item| {
+            container.find_property(item, |p| match p {
+                Property::HvcC(record) => Some(record.clone()),
+                _ => None,
+            })
+        })
+        .and_then(|record| hevc::parse_hvcc(&record).ok())
+        .and_then(|config| {
+            config
+                .parameter_sets
+                .iter()
+                .find(|nal| sps::is_sps(nal))
+                .and_then(|nal| sps::vui_colour(nal))
+        });
+    if let Some(vui) = vui {
+        nclx.full_range = vui.full_range;
+        if let Some((primaries, transfer, matrix)) = vui.description {
+            if primaries != UNSPECIFIED {
+                nclx.primaries = u16::from(primaries);
+            }
+            if transfer != UNSPECIFIED {
+                nclx.transfer = u16::from(transfer);
+            }
+            if matrix != UNSPECIFIED {
+                nclx.matrix = u16::from(matrix);
+            }
+        }
+    }
+    nclx
 }
 
 /// Try to decode an alpha auxiliary image into a u16 plane (full-scale
