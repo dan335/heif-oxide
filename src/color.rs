@@ -197,6 +197,58 @@ fn linear_to_srgb(v: f32) -> f32 {
     }
 }
 
+/// Interpolated lookup tables for the two sRGB transfer curves.
+///
+/// The gamut conversion needs three decodes and three encodes per pixel.
+/// Calling `powf` for each one adds roughly half again to the time of a
+/// whole 24-megapixel decode; linear interpolation over these tables
+/// reproduces the exact curves to well under 1/100 of a 16-bit code value.
+struct SrgbTables {
+    /// `srgb_to_linear(i / STEPS)`.
+    to_linear: Vec<f32>,
+    /// `linear_to_srgb((i / STEPS)²)`. Indexing by the square root of the
+    /// linear value flattens the curve's steep start, so a uniformly
+    /// spaced table stays accurate in the shadows.
+    from_linear_sqrt: Vec<f32>,
+}
+
+impl SrgbTables {
+    /// Intervals per table (each table has `STEPS + 1` entries).
+    const STEPS: usize = 4096;
+
+    /// The process-wide tables, built on first use.
+    fn get() -> &'static SrgbTables {
+        static TABLES: std::sync::OnceLock<SrgbTables> = std::sync::OnceLock::new();
+        TABLES.get_or_init(|| {
+            let at = |i: usize| i as f32 / Self::STEPS as f32;
+            SrgbTables {
+                to_linear: (0..=Self::STEPS).map(|i| srgb_to_linear(at(i))).collect(),
+                from_linear_sqrt: (0..=Self::STEPS)
+                    .map(|i| linear_to_srgb(at(i) * at(i)))
+                    .collect(),
+            }
+        })
+    }
+
+    /// Interpolate `table` at `position`, which must be within 0.0..=1.0.
+    fn lookup(table: &[f32], position: f32) -> f32 {
+        let scaled = position * Self::STEPS as f32;
+        let index = (scaled as usize).min(Self::STEPS - 1);
+        let low = table[index];
+        low + (table[index + 1] - low) * (scaled - index as f32)
+    }
+
+    /// sRGB EOTF for a value within 0.0..=1.0.
+    fn decode(&self, v: f32) -> f32 {
+        Self::lookup(&self.to_linear, v)
+    }
+
+    /// sRGB OETF for a value within 0.0..=1.0.
+    fn encode(&self, v: f32) -> f32 {
+        Self::lookup(&self.from_linear_sqrt, v.sqrt())
+    }
+}
+
 /// Linear-light RGB→RGB matrix converting the tagged primaries to sRGB,
 /// or `None` when the pixels are already sRGB (or we don't know better).
 fn primaries_to_srgb_matrix(primaries: u16) -> Option<[[f32; 3]; 3]> {
@@ -227,6 +279,7 @@ pub fn yuv_to_rgb(img: &YuvImage, nclx: &Nclx) -> RgbBuffer {
     let scale = (1u32 << (img.bit_depth - 8)) as f32;
     let max = ((1u32 << img.bit_depth) - 1) as f32;
     let primaries_matrix = primaries_to_srgb_matrix(nclx.primaries);
+    let srgb = SrgbTables::get();
 
     // Range expansion: limited range puts Y in [16..235]*2^(d-8) and chroma
     // in [16..240]*2^(d-8); full range uses the whole code range.
@@ -302,18 +355,12 @@ pub fn yuv_to_rgb(img: &YuvImage, nclx: &Nclx) -> RgbBuffer {
                 if let Some(m) = &primaries_matrix {
                     // Convert wide-gamut primaries to sRGB through linear
                     // light, clamping out-of-gamut results.
-                    let rl = srgb_to_linear(r.clamp(0.0, 1.0));
-                    let gl = srgb_to_linear(g.clamp(0.0, 1.0));
-                    let bl = srgb_to_linear(b.clamp(0.0, 1.0));
-                    r = linear_to_srgb(
-                        (m[0][0] * rl + m[0][1] * gl + m[0][2] * bl).clamp(0.0, 1.0),
-                    );
-                    g = linear_to_srgb(
-                        (m[1][0] * rl + m[1][1] * gl + m[1][2] * bl).clamp(0.0, 1.0),
-                    );
-                    b = linear_to_srgb(
-                        (m[2][0] * rl + m[2][1] * gl + m[2][2] * bl).clamp(0.0, 1.0),
-                    );
+                    let rl = srgb.decode(r.clamp(0.0, 1.0));
+                    let gl = srgb.decode(g.clamp(0.0, 1.0));
+                    let bl = srgb.decode(b.clamp(0.0, 1.0));
+                    r = srgb.encode((m[0][0] * rl + m[0][1] * gl + m[0][2] * bl).clamp(0.0, 1.0));
+                    g = srgb.encode((m[1][0] * rl + m[1][1] * gl + m[1][2] * bl).clamp(0.0, 1.0));
+                    b = srgb.encode((m[2][0] * rl + m[2][1] * gl + m[2][2] * bl).clamp(0.0, 1.0));
                 }
 
                 let i = local_row * w * 3 + x * 3;
