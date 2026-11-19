@@ -2,7 +2,7 @@
 name = "heif-oxide"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "Pure-Rust HEIF/HEIC still-image decoder (ISOBMFF container + HEVC via rust_h265). Decodes iPhone photos — grid tiles, 10-bit, Display P3 — with no C dependencies."
 repository = "https://github.com/dan335/heif-oxide"
@@ -11,5 +11,5 @@ categories = ["multimedia::images", "multimedia::encoding"]
 readme = "README.md"
 
 [dependencies]
-rust_h265 = "0.1"
+rust_h265 = "0.4.1"
 thiserror = "2"

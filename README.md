@@ -1,12 +1,14 @@
 # heif-oxide
 
-Pure-Rust HEIF/HEIC still-image decoder. No C dependencies, no `unsafe`,
-MIT OR Apache-2.0.
+Pure-Rust HEIF/HEIC still-image decoder. No C dependencies, no `unsafe` in
+this crate, MIT OR Apache-2.0. Requires Rust 1.88 or newer.
 
 Parses the HEIF container (ISO/IEC 23008-12) and decodes the HEVC payload
-with [`rust_h265`](https://crates.io/crates/rust_h265) — a pure-Rust HEVC
-decoder. To our knowledge this is the first permissively-licensed way to
-open iPhone photos in Rust without linking libheif/libde265.
+with [`rust_h265`](https://crates.io/crates/rust_h265) 0.4 — a pure-Rust
+HEVC decoder (its only `unsafe` is one documented module that supports its
+multithreaded decoding). To our knowledge this is the first
+permissively-licensed way to open iPhone photos in Rust without linking
+libheif/libde265.
 
 ```rust
 let image = heif_oxide::decode_file("photo.heic")?;
@@ -38,20 +40,24 @@ Output is always display-ready sRGB.
 - AVIF (`av01`) and JPEG-in-HEIF payloads — rejected with a clear error
   naming the codec.
 - Image sequences (track/`moov`-based files), identity-derived (`iden`)
-  items, overlays (`iovl`), multi-layer (`lhv1`) and 4:4:4 streams,
-  protected items, external data references.
+  items, overlays (`iovl`), protected items, external data references.
+- Multi-layer (`lhv1`) items. When the primary item is the `hvc1` base
+  layer of a layered file, that base layer decodes.
+- 4:4:4 streams are rejected with a clear error: `rust_h265` decodes them,
+  but the colour pipeline here is 4:2:0-only.
 - ICC profiles are reported (`ColorInfo::icc_present`) but not applied;
   PQ/HLG HDR transfers are not tone-mapped.
 
 ## Status
 
 On the [Nokia HEIF conformance suite](https://github.com/nokiatech/heif_conformance),
-44 of 63 files decode; the rest are rejected cleanly for the unsupported
+46 of 63 files decode; the rest are rejected cleanly for the unsupported
 features listed above. Tested against real iPhone photos.
 
-Decoding is slower than libheif (the HEVC decoder is scalar pure Rust,
-roughly 5× slower than FFmpeg's) — a 12-megapixel iPhone photo takes on the
-order of a second, with grid tiles spread across cores.
+The HEVC decoder is pure Rust. Its own benchmarks put `rust_h265` 0.4 at
+roughly 1.5× slower than single-threaded FFmpeg on 8-bit video, and faster
+on 10-bit. A 12-megapixel iPhone photo takes on the order of a second, with
+grid tiles spread across cores.
 
 ## Testing
 
