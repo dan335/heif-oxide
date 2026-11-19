@@ -221,6 +221,67 @@ fn decodes_alpha_auxiliary() {
     }
 }
 
+#[test]
+fn reads_metadata_without_decoding_pixels() {
+    let (hvcc, _) = fixture_item("flat_red_64");
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload: vec![0xFF],
+        props: vec![(true, hvcc), (false, tb::ispe(64, 48)), (false, nclx_601())],
+    }];
+    let metadata = read_metadata(&tb::make_heic(&items, 1, &[])).expect("metadata");
+    assert_eq!((metadata.width, metadata.height), (64, 48));
+    assert_eq!(metadata.bit_depth, 8);
+    assert!(!metadata.has_alpha);
+    assert_eq!(metadata.color.nclx.expect("nclx").matrix, 6);
+}
+
+#[test]
+fn reads_grid_metadata_with_orientation() {
+    let file = grid_heic(
+        "flat_red_64",
+        "flat_blue_64",
+        100,
+        50,
+        vec![(true, tb::irot(1))],
+    );
+    let metadata = read_metadata(&file).expect("metadata");
+    assert_eq!((metadata.width, metadata.height), (50, 100));
+    assert_eq!(metadata.bit_depth, 8);
+}
+
+#[test]
+fn reads_ten_bit_and_alpha_metadata() {
+    let (mut hvcc_main, payload_main) = fixture_item("flat_mid_64_10bit");
+    hvcc_main[25] = 0xFA;
+    let (hvcc_alpha, payload_alpha) = fixture_item("flat_gray_64");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"hvc1",
+            payload: payload_main,
+            props: vec![(true, hvcc_main), (false, tb::ispe(64, 64))],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: payload_alpha,
+            props: vec![
+                (true, hvcc_alpha),
+                (
+                    false,
+                    tb::full_box(b"auxC", 0, 0, b"urn:mpeg:hevc:2015:auxid:1\0"),
+                ),
+            ],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"auxl", 2, vec![1])]);
+    let metadata = read_metadata(&file).expect("metadata");
+    assert_eq!(metadata.bit_depth, 10);
+    assert!(metadata.has_alpha);
+}
+
 /// Non-HEVC primary items are rejected with the codec named.
 #[test]
 fn rejects_av01_item() {

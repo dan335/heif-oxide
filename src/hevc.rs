@@ -23,6 +23,19 @@ pub struct HvcConfig {
     pub parameter_sets: Vec<Vec<u8>>,
 }
 
+/// Read the luma bit depth from an HEVCDecoderConfigurationRecord.
+pub fn hvcc_bit_depth(record: &[u8]) -> Result<u8, HeifError> {
+    let mut r = Reader::new(record, "hvcC");
+    let version = r.u8()?;
+    if version != 1 {
+        return Err(HeifError::Invalid(format!(
+            "hvcC configurationVersion {version} (expected 1)"
+        )));
+    }
+    r.skip(16)?;
+    Ok((r.u8()? & 0x7) + 8)
+}
+
 /// Parse an HEVCDecoderConfigurationRecord.
 pub fn parse_hvcc(record: &[u8]) -> Result<HvcConfig, HeifError> {
     let mut r = Reader::new(record, "hvcC");
