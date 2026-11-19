@@ -127,7 +127,7 @@ pub fn annex_b_to_item(annex_b: &[u8]) -> (Vec<u8>, Vec<u8>) {
 
 /// Minimal Annex B splitter (handles 3- and 4-byte start codes) so the
 /// builder doesn't depend on the code under test.
-fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
+pub fn split_annex_b(data: &[u8]) -> Vec<&[u8]> {
     let mut starts = Vec::new();
     let mut i = 0;
     while i + 3 <= data.len() {
