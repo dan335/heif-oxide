@@ -81,8 +81,8 @@ pub enum Property {
     Irot {
         angle: u8,
     },
-    /// Mirror: axis 0 = about a vertical axis (left↔right),
-    /// axis 1 = about a horizontal axis (top↔bottom).
+    /// Mirror: axis 0 = top↔bottom exchanged, axis 1 = left↔right
+    /// exchanged.
     Imir {
         axis: u8,
     },

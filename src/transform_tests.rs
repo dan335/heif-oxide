@@ -49,12 +49,12 @@ fn rotations_compose_to_identity() {
 
 #[test]
 fn mirror_axes() {
-    // axis 0: about a vertical axis → left↔right.
+    // axis 0: top↔bottom exchanged.
     let (out, ..) = apply1(&[1, 2, 3, 4], 2, 2, Property::Imir { axis: 0 });
-    assert_eq!(out, vec![2, 1, 4, 3]);
-    // axis 1: about a horizontal axis → top↔bottom.
-    let (out, ..) = apply1(&[1, 2, 3, 4], 2, 2, Property::Imir { axis: 1 });
     assert_eq!(out, vec![3, 4, 1, 2]);
+    // axis 1: left↔right exchanged.
+    let (out, ..) = apply1(&[1, 2, 3, 4], 2, 2, Property::Imir { axis: 1 });
+    assert_eq!(out, vec![2, 1, 4, 3]);
 }
 
 #[test]
@@ -141,6 +141,6 @@ fn crop_top_left_basic() {
 fn multichannel_pixels_stay_together() {
     // 2x1 RGB pixels: red then blue; mirroring must swap whole pixels.
     let src = vec![255u8, 0, 0, 0, 0, 255];
-    let (out, ..) = apply_transforms(src, 2, 1, 3, &[Property::Imir { axis: 0 }]).unwrap();
+    let (out, ..) = apply_transforms(src, 2, 1, 3, &[Property::Imir { axis: 1 }]).unwrap();
     assert_eq!(out, vec![0, 0, 255, 255, 0, 0]);
 }
