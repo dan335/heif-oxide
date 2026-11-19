@@ -39,6 +39,7 @@ println!("{}x{}, {}-bit", metadata.width, metadata.height, metadata.bit_depth);
 | Display P3 → sRGB conversion (iPhone default) | ✅ linear-light 3×3 |
 | Alpha auxiliary images | ⚠️ only when 4:2:0-coded (monochrome alpha needs a 4:0:0 decoder) |
 | `idat`-stored payloads, multi-extent items | ✅ |
+| `wasm32` targets | ✅ builds; decodes on a single thread there |
 | Malformed input | errors, never panics (every parse is bounds-checked) |
 
 Output is always display-ready sRGB.
@@ -75,6 +76,10 @@ the colour pipeline against hand-computed reference values, and the full
 decode path against tiny losslessly-encoded x265 fixtures (committed under
 `testdata/`, generated from flat frames with exactly known plane values —
 see `src/lib_tests.rs`).
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

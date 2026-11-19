@@ -12,13 +12,18 @@
 //! - Single-picture `hvc1` files from other cameras and encoders.
 //!
 //! Output is display-ready sRGB, 8-bit (`Rgb8`) or 16-bit (`Rgb16`, for
-//! 10/12-bit sources).
+//! 10/12-bit sources). Sample range, matrix and primaries come from the
+//! container's `colr` nclx box or, when a file has none (iPhone photos carry
+//! an ICC profile instead), from the HEVC bitstream's own VUI signalling.
 //!
 //! ```no_run
 //! let image = heif_oxide::decode_file("photo.heic").unwrap();
 //! println!("{}x{}, {} channels", image.width, image.height, image.channels());
 //! let rgba = image.to_rgba8();
 //! ```
+//!
+//! [`read_metadata`] returns the dimensions, bit depth, alpha presence and
+//! colour information without decoding any pixels.
 //!
 //! ## Limitations
 //!
