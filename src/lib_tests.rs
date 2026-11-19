@@ -147,9 +147,22 @@ fn applies_grid_rotation() {
     assert!(is_reddish(px(&image, 25, 95)), "{:?}", px(&image, 25, 95));
 }
 
-/// imir mirrors the assembled image left↔right.
+/// imir axis 1 exchanges left and right of the assembled image; axis 0
+/// exchanges top and bottom, which leaves a left|right split where it was.
+/// (Checked against libheif, which decodes the same files this way.)
 #[test]
 fn applies_grid_mirror() {
+    let file = grid_heic(
+        "flat_red_64",
+        "flat_blue_64",
+        100,
+        50,
+        vec![(true, tb::imir(1))],
+    );
+    let image = decode_bytes(&file).expect("decode");
+    assert!(is_bluish(px(&image, 5, 25)), "{:?}", px(&image, 5, 25));
+    assert!(is_reddish(px(&image, 95, 25)), "{:?}", px(&image, 95, 25));
+
     let file = grid_heic(
         "flat_red_64",
         "flat_blue_64",
@@ -158,8 +171,8 @@ fn applies_grid_mirror() {
         vec![(true, tb::imir(0))],
     );
     let image = decode_bytes(&file).expect("decode");
-    assert!(is_bluish(px(&image, 5, 25)), "{:?}", px(&image, 5, 25));
-    assert!(is_reddish(px(&image, 95, 25)), "{:?}", px(&image, 95, 25));
+    assert!(is_reddish(px(&image, 5, 25)), "{:?}", px(&image, 5, 25));
+    assert!(is_bluish(px(&image, 95, 25)), "{:?}", px(&image, 95, 25));
 }
 
 /// A 10-bit source comes out as full-scale Rgb16.

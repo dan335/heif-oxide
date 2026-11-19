@@ -63,7 +63,7 @@ pub fn irot(angle: u8) -> Vec<u8> {
     plain_box(b"irot", &[angle & 0x3])
 }
 
-/// An `imir` property box (axis 0 = vertical axis / left-right).
+/// An `imir` property box (axis 0 = top↔bottom, axis 1 = left↔right).
 pub fn imir(axis: u8) -> Vec<u8> {
     plain_box(b"imir", &[axis & 0x1])
 }
