@@ -25,9 +25,13 @@ use crate::error::HeifError;
 /// The `colr` nclx colour description (CICP code points, H.273 numbering).
 #[derive(Debug, Clone, Copy)]
 pub struct Nclx {
+    /// Colour primaries (1 = BT.709/sRGB, 9 = BT.2020, 12 = Display P3).
     pub primaries: u16,
+    /// Transfer characteristics (1 = BT.709, 13 = sRGB, 16 = PQ, 18 = HLG).
     pub transfer: u16,
+    /// Matrix coefficients (1 = BT.709, 6 = BT.601, 9 = BT.2020).
     pub matrix: u16,
+    /// Full-range samples rather than limited ("video") range.
     pub full_range: bool,
 }
 

@@ -80,6 +80,7 @@ non-exhaustive, so downstream matches need a wildcard arm.
 | `idat`-stored payloads, multi-extent items | ✅ |
 | `wasm32` targets | ✅ builds; decodes on a single thread there |
 | Malformed input | errors, never panics (every parse is bounds-checked) |
+| Hostile input (decompression bombs, spoofed sizes) | ✅ bounded by configurable [decode limits](#decode-limits) |
 
 Output is always display-ready sRGB.
 
@@ -105,8 +106,9 @@ features listed above. Tested against real iPhone photos.
 
 The HEVC decoder is pure Rust. Its own benchmarks put `rust_h265` 0.4 at
 roughly 1.5× slower than single-threaded FFmpeg on 8-bit video, and faster
-on 10-bit. A 12-megapixel iPhone photo takes on the order of a second, with
-grid tiles spread across cores.
+on 10-bit. With grid tiles spread across cores, a 24-megapixel iPhone photo
+decodes in about 0.35 s on a 20-thread desktop; expect proportionally longer
+on fewer cores.
 
 ## Testing
 
