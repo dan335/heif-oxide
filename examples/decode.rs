@@ -35,7 +35,7 @@ fn main() {
         let rgba = image.to_rgba8();
         let mut ppm = Vec::with_capacity(rgba.len() / 4 * 3 + 64);
         write!(ppm, "P6\n{} {}\n255\n", image.width, image.height).unwrap();
-        for px in rgba.chunks_exact(4) {
+        for px in rgba.as_chunks::<4>().0 {
             ppm.extend_from_slice(&px[..3]);
         }
         std::fs::write(&output, ppm).expect("write output");

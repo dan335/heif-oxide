@@ -17,8 +17,6 @@ use crate::error::HeifError;
 /// Brands (major or compatible) we accept in `ftyp`. Everything here stores
 /// still images with HEVC-decodable payloads or is the codec-agnostic
 /// structural brand (`mif1`); the actual codec check happens per-item.
-const MAX_ITEM_PAYLOAD_SIZE: usize = 256 * 1024 * 1024;
-
 const ACCEPTED_BRANDS: [&[u8; 4]; 8] = [
     b"heic", b"heix", b"heim", b"heis", // HEVC still image brands
     b"hevc", b"hevx", // HEVC image sequence brands (often listed as compatible)
@@ -83,8 +81,8 @@ pub enum Property {
     Irot {
         angle: u8,
     },
-    /// Mirror: axis 0 = about a vertical axis (left↔right),
-    /// axis 1 = about a horizontal axis (top↔bottom).
+    /// Mirror: axis 0 = top↔bottom exchanged, axis 1 = left↔right
+    /// exchanged.
     Imir {
         axis: u8,
     },
@@ -125,6 +123,7 @@ pub struct ItemReference {
 /// copying) the file bytes for payload extents.
 pub struct Container<'a> {
     data: &'a [u8],
+    max_item_payload_bytes: usize,
     pub primary_item: u32,
     pub items: HashMap<u32, ItemInfo>,
     pub locations: HashMap<u32, ItemLocation>,
@@ -203,6 +202,7 @@ impl<'a> Container<'a> {
                 )))
             }
         };
+        let max_item_payload_bytes = self.max_item_payload_bytes;
         let mut ranges = Vec::with_capacity(loc.extents.len());
         let mut payload_len = 0usize;
         for &(offset, length) in &loc.extents {
@@ -226,10 +226,10 @@ impl<'a> Container<'a> {
             }
             payload_len = payload_len
                 .checked_add(end - start)
-                .filter(|&len| len <= MAX_ITEM_PAYLOAD_SIZE)
+                .filter(|&len| len <= max_item_payload_bytes)
                 .ok_or_else(|| {
                     HeifError::Invalid(format!(
-                        "item {item_id} payload exceeds {MAX_ITEM_PAYLOAD_SIZE} bytes"
+                        "item {item_id} payload exceeds {max_item_payload_bytes} bytes"
                     ))
                 })?;
             ranges.push(start..end);
@@ -247,8 +247,16 @@ impl<'a> Container<'a> {
 
 /// Parse the top level of a HEIF file: verify `ftyp`, then parse `meta`.
 pub fn parse(data: &[u8]) -> Result<Container<'_>, HeifError> {
+    parse_with_limits(data, crate::Limits::default().max_item_payload_bytes)
+}
+
+pub fn parse_with_limits(
+    data: &[u8],
+    max_item_payload_bytes: usize,
+) -> Result<Container<'_>, HeifError> {
     let mut container = Container {
         data,
+        max_item_payload_bytes,
         primary_item: 0,
         items: HashMap::new(),
         locations: HashMap::new(),

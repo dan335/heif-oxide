@@ -22,7 +22,7 @@ fn assert_flat_rgb8(image: &DecodedImage, expected: [u8; 3], tolerance: i16) {
         panic!("expected Rgb8 pixels");
     };
     assert_eq!(buf.len(), (image.width * image.height * 3) as usize);
-    for px in buf.chunks_exact(3) {
+    for px in buf.as_chunks::<3>().0 {
         for c in 0..3 {
             assert!(
                 (px[c] as i16 - expected[c] as i16).abs() <= tolerance,
@@ -147,9 +147,22 @@ fn applies_grid_rotation() {
     assert!(is_reddish(px(&image, 25, 95)), "{:?}", px(&image, 25, 95));
 }
 
-/// imir mirrors the assembled image left↔right.
+/// imir axis 1 exchanges left and right of the assembled image; axis 0
+/// exchanges top and bottom, which leaves a left|right split where it was.
+/// (Checked against libheif, which decodes the same files this way.)
 #[test]
 fn applies_grid_mirror() {
+    let file = grid_heic(
+        "flat_red_64",
+        "flat_blue_64",
+        100,
+        50,
+        vec![(true, tb::imir(1))],
+    );
+    let image = decode_bytes(&file).expect("decode");
+    assert!(is_bluish(px(&image, 5, 25)), "{:?}", px(&image, 5, 25));
+    assert!(is_reddish(px(&image, 95, 25)), "{:?}", px(&image, 95, 25));
+
     let file = grid_heic(
         "flat_red_64",
         "flat_blue_64",
@@ -158,8 +171,8 @@ fn applies_grid_mirror() {
         vec![(true, tb::imir(0))],
     );
     let image = decode_bytes(&file).expect("decode");
-    assert!(is_bluish(px(&image, 5, 25)), "{:?}", px(&image, 5, 25));
-    assert!(is_reddish(px(&image, 95, 25)), "{:?}", px(&image, 95, 25));
+    assert!(is_reddish(px(&image, 5, 25)), "{:?}", px(&image, 5, 25));
+    assert!(is_bluish(px(&image, 95, 25)), "{:?}", px(&image, 95, 25));
 }
 
 /// A 10-bit source comes out as full-scale Rgb16.
@@ -215,7 +228,7 @@ fn decodes_alpha_auxiliary() {
         panic!("expected Rgba8");
     };
     // Alpha = luma 128 read full-range → 128; colour channels still red.
-    for p in buf.chunks_exact(4) {
+    for p in buf.as_chunks::<4>().0 {
         assert!((p[0] as i16 - 254).abs() <= 1 && p[1] <= 1 && p[2] <= 1);
         assert!((p[3] as i16 - 128).abs() <= 1, "alpha {}", p[3]);
     }
@@ -303,15 +316,315 @@ fn rejects_oversized_image_before_decoding() {
         payload: vec![0; 16],
         props: vec![(false, tb::ispe(65, 64))],
     }];
+    let mut limits = Limits::default();
+    limits.max_pixels = 64 * 64;
     assert!(matches!(
-        decode_bytes_with_limit(&tb::make_heic(&items, 1, &[]), (64, 64)),
+        decode_bytes_with(&tb::make_heic(&items, 1, &[]), &limits),
         Err(HeifError::ImageTooLarge {
             width: 65,
             height: 64,
-            max_width: 64,
-            max_height: 64,
+            max_pixels: 4096,
         })
     ));
+}
+
+#[test]
+fn default_limits() {
+    let limits = Limits::default();
+    assert_eq!(limits.max_pixels, 100_000_000);
+    assert_eq!(limits.max_grid_tiles, 1024);
+    assert_eq!(limits.max_item_payload_bytes, 256 * 1024 * 1024);
+    assert_eq!(limits.max_picture_memory_bytes, 1024 * 1024 * 1024);
+}
+
+#[test]
+fn decodes_image_at_pixel_limit() {
+    let mut limits = Limits::default();
+    limits.max_pixels = 64 * 64;
+    let image = decode_bytes_with(&single_item_heic("flat_red_64"), &limits).expect("decode");
+    assert_eq!((image.width, image.height), (64, 64));
+    assert_flat_rgb8(&image, [254, 0, 0], 1);
+}
+
+#[test]
+fn rejects_spoofed_dimensions_using_bitstream_pixel_limit() {
+    let (hvcc, payload) = fixture_item("flat_red_64");
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload,
+        props: vec![(true, hvcc), (false, tb::ispe(8, 8))],
+    }];
+    let file = tb::make_heic(&items, 1, &[]);
+    assert_eq!(decode_bytes(&file).expect("decode").width, 64);
+    let mut limits = Limits::default();
+    limits.max_pixels = 256;
+    assert!(matches!(
+        decode_bytes_with(&file, &limits),
+        Err(HeifError::Codec(_))
+            | Err(HeifError::ImageTooLarge {
+                width: 64,
+                height: 64,
+                max_pixels: 256,
+            })
+    ));
+}
+
+#[test]
+fn enforces_bitstream_pixel_limit_without_ispe() {
+    let (hvcc, payload) = fixture_item("flat_red_64");
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload,
+        props: vec![(true, hvcc), (false, nclx_601())],
+    }];
+    let file = tb::make_heic(&items, 1, &[]);
+    let mut limits = Limits::default();
+    limits.max_pixels = 256;
+    assert!(matches!(
+        decode_bytes_with(&file, &limits),
+        Err(HeifError::Codec(_))
+    ));
+    let image = decode_bytes(&file).expect("decode without ispe");
+    assert_eq!((image.width, image.height), (64, 64));
+    assert_flat_rgb8(&image, [254, 0, 0], 1);
+}
+
+#[test]
+fn enforces_bitstream_pixel_limit_on_grid_tiles() {
+    let (hvcc, payload) = fixture_item("flat_red_64");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"grid",
+            payload: tb::grid_payload(1, 1, 8, 8),
+            props: vec![],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload,
+            props: vec![(true, hvcc), (false, tb::ispe(8, 8))],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"dimg", 1, vec![2])]);
+    let image = decode_bytes(&file).expect("decode");
+    assert_eq!((image.width, image.height), (8, 8));
+    let mut limits = Limits::default();
+    limits.max_pixels = 256;
+    assert!(matches!(
+        decode_bytes_with(&file, &limits),
+        Err(HeifError::Codec(_))
+            | Err(HeifError::ImageTooLarge {
+                width: 64,
+                height: 64,
+                max_pixels: 256,
+            })
+    ));
+}
+
+#[test]
+fn enforces_actual_grid_aggregate_before_cropping() {
+    let (hvcc, payload) = fixture_item("flat_red_64");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"grid",
+            payload: tb::grid_payload(1, 2, 8, 8),
+            props: vec![(false, tb::ispe(8, 8)), (false, nclx_601())],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: payload.clone(),
+            props: vec![(true, hvcc.clone()), (false, tb::ispe(8, 8))],
+        },
+        tb::TestItem {
+            id: 3,
+            item_type: *b"hvc1",
+            payload,
+            props: vec![(true, hvcc), (false, tb::ispe(8, 8))],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"dimg", 1, vec![2, 3])]);
+    let mut limits = Limits::default();
+    limits.max_pixels = 4096;
+    assert!(matches!(
+        decode_bytes_with(&file, &limits),
+        Err(HeifError::Codec(_))
+    ));
+    limits.max_pixels = 8192;
+    let image = decode_bytes_with(&file, &limits).expect("decode at actual grid aggregate limit");
+    assert_eq!((image.width, image.height), (8, 8));
+    assert_flat_rgb8(&image, [254, 0, 0], 1);
+}
+
+#[test]
+fn propagates_pixel_limit_to_alpha_decoder() {
+    let (hvcc_main, payload_main) = fixture_item("flat_red_64");
+    let (hvcc_alpha, payload_alpha) = fixture_item("flat_gray_64");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"hvc1",
+            payload: payload_main,
+            props: vec![(true, hvcc_main), (false, nclx_601())],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: payload_alpha,
+            props: vec![
+                (true, hvcc_alpha),
+                (
+                    false,
+                    tb::full_box(b"auxC", 0, 0, b"urn:mpeg:hevc:2015:auxid:1\0"),
+                ),
+            ],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"auxl", 2, vec![1])]);
+    let container = boxes::parse(&file).expect("parse");
+    let mut limits = Limits::default();
+    limits.max_pixels = 256;
+    assert!(decode_alpha_plane(&container, 1, 64, 64, &limits).is_none());
+    let alpha = decode_alpha_plane(&container, 1, 64, 64, &Limits::default())
+        .expect("decode alpha with default limits");
+    assert_eq!(alpha.len(), 64 * 64);
+    for sample in alpha {
+        assert!((i32::from(sample) - 128 * 257).abs() <= 257);
+    }
+}
+
+#[test]
+fn rejects_grid_output_above_pixel_limit_before_decoding() {
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"grid",
+        payload: tb::grid_payload(1, 1, 65, 64),
+        props: vec![(false, tb::ispe(8, 8))],
+    }];
+    let mut limits = Limits::default();
+    limits.max_pixels = 64 * 64;
+    assert!(matches!(
+        decode_bytes_with(&tb::make_heic(&items, 1, &[]), &limits),
+        Err(HeifError::ImageTooLarge {
+            width: 65,
+            height: 64,
+            max_pixels: 4096,
+        })
+    ));
+}
+
+#[test]
+fn enforces_custom_picture_memory_limit() {
+    let file = single_item_heic("flat_red_64");
+    let mut limits = Limits::default();
+    limits.max_picture_memory_bytes = 1;
+    assert!(matches!(
+        decode_bytes_with(&file, &limits),
+        Err(HeifError::Codec(_))
+    ));
+    limits.max_picture_memory_bytes = Limits::default().max_picture_memory_bytes;
+    decode_bytes_with(&file, &limits).expect("decode with default picture memory limit");
+}
+
+#[test]
+fn enforces_custom_grid_tile_limit() {
+    let file = grid_heic("flat_red_64", "flat_blue_64", 100, 50, vec![]);
+    let mut limits = Limits::default();
+    limits.max_grid_tiles = 1;
+    assert!(matches!(
+        decode_bytes_with(&file, &limits),
+        Err(HeifError::Invalid(message)) if message.contains("maximum is 1")
+    ));
+    limits.max_grid_tiles = 2;
+    let image = decode_bytes_with(&file, &limits).expect("decode at tile limit");
+    assert_eq!((image.width, image.height), (100, 50));
+}
+
+#[test]
+fn enforces_custom_item_payload_limit() {
+    let (hvcc, payload) = fixture_item("flat_red_64");
+    let payload_len = payload.len();
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload,
+        props: vec![(true, hvcc), (false, tb::ispe(64, 64)), (false, nclx_601())],
+    }];
+    let file = tb::make_heic(&items, 1, &[]);
+    let mut limits = Limits::default();
+    limits.max_item_payload_bytes = payload_len - 1;
+    assert!(matches!(
+        decode_bytes_with(&file, &limits),
+        Err(HeifError::Invalid(_))
+    ));
+    limits.max_item_payload_bytes = payload_len;
+    let image = decode_bytes_with(&file, &limits).expect("decode at payload limit");
+    assert_flat_rgb8(&image, [254, 0, 0], 1);
+}
+
+#[test]
+fn reads_metadata_without_decoding_pixels() {
+    let (hvcc, _) = fixture_item("flat_red_64");
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload: vec![0xFF],
+        props: vec![(true, hvcc), (false, tb::ispe(64, 48)), (false, nclx_601())],
+    }];
+    let metadata = read_metadata(&tb::make_heic(&items, 1, &[])).expect("metadata");
+    assert_eq!((metadata.width, metadata.height), (64, 48));
+    assert_eq!(metadata.bit_depth, 8);
+    assert!(!metadata.has_alpha);
+    assert_eq!(metadata.color.nclx.expect("nclx").matrix, 6);
+}
+
+#[test]
+fn reads_grid_metadata_with_orientation() {
+    let file = grid_heic(
+        "flat_red_64",
+        "flat_blue_64",
+        100,
+        50,
+        vec![(true, tb::irot(1))],
+    );
+    let metadata = read_metadata(&file).expect("metadata");
+    assert_eq!((metadata.width, metadata.height), (50, 100));
+    assert_eq!(metadata.bit_depth, 8);
+}
+
+#[test]
+fn reads_ten_bit_and_alpha_metadata() {
+    let (mut hvcc_main, payload_main) = fixture_item("flat_mid_64_10bit");
+    hvcc_main[25] = 0xFA;
+    let (hvcc_alpha, payload_alpha) = fixture_item("flat_gray_64");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"hvc1",
+            payload: payload_main,
+            props: vec![(true, hvcc_main), (false, tb::ispe(64, 64))],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: payload_alpha,
+            props: vec![
+                (true, hvcc_alpha),
+                (
+                    false,
+                    tb::full_box(b"auxC", 0, 0, b"urn:mpeg:hevc:2015:auxid:1\0"),
+                ),
+            ],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"auxl", 2, vec![1])]);
+    let metadata = read_metadata(&file).expect("metadata");
+    assert_eq!(metadata.bit_depth, 10);
+    assert!(metadata.has_alpha);
 }
 
 /// Non-HEVC primary items are rejected with the codec named.
@@ -360,6 +673,83 @@ fn corrupt_payload_is_an_error() {
         props: vec![(true, hvcc)],
     }];
     assert!(decode_bytes(&tb::make_heic(&items, 1, &[])).is_err());
+}
+
+/// A 4:4:4 codestream decodes in rust_h265 but is rejected cleanly here
+/// (the colour pipeline is 4:2:0-only).
+#[test]
+fn rejects_444_chroma() {
+    match decode_bytes(&single_item_heic("flat_red_64_444")) {
+        Err(HeifError::Unsupported(msg)) => assert!(msg.contains("chroma_format_idc 3"), "{msg}"),
+        other => panic!("expected Unsupported, got {:?}", other.err()),
+    }
+}
+
+/// `flat_full_range_64` is a flat Y=60 Cb=110 Cr=160 picture whose SPS VUI
+/// signals what an iPhone writes: full range, BT.601 matrix, Display P3
+/// primaries. Decoded with that description it is this sRGB colour; with
+/// the limited-range BT.709 defaults it would be [109, 38, 13].
+const FULL_RANGE_P3_RGB: [u8; 3] = [114, 38, 22];
+
+/// A file with no `colr` nclx box takes range, matrix and primaries from
+/// the bitstream's VUI instead of assuming limited-range BT.709.
+#[test]
+fn bitstream_colour_is_used_without_nclx() {
+    let (hvcc, payload) = fixture_item("flat_full_range_64");
+    let items = [tb::TestItem {
+        id: 1,
+        item_type: *b"hvc1",
+        payload,
+        props: vec![(true, hvcc), (false, tb::ispe(64, 64))],
+    }];
+    let image = decode_bytes(&tb::make_heic(&items, 1, &[])).expect("decode");
+    assert_flat_rgb8(&image, FULL_RANGE_P3_RGB, 1);
+    // `color.nclx` reports the container, which declared nothing.
+    assert!(image.color.nclx.is_none());
+}
+
+/// The iPhone layout: a grid whose only `colr` is an ICC profile. The
+/// tiles' VUI still drives the conversion.
+#[test]
+fn bitstream_colour_is_used_for_grid_with_icc_only() {
+    let (hvcc_l, payload_l) = fixture_item("flat_full_range_64");
+    let (hvcc_r, payload_r) = fixture_item("flat_full_range_64");
+    let icc = tb::plain_box(b"colr", b"prof\0\0\0\0");
+    let items = [
+        tb::TestItem {
+            id: 1,
+            item_type: *b"grid",
+            payload: tb::grid_payload(1, 2, 100, 50),
+            props: vec![(false, tb::ispe(100, 50)), (false, icc)],
+        },
+        tb::TestItem {
+            id: 2,
+            item_type: *b"hvc1",
+            payload: payload_l,
+            props: vec![(true, hvcc_l), (false, tb::ispe(64, 64))],
+        },
+        tb::TestItem {
+            id: 3,
+            item_type: *b"hvc1",
+            payload: payload_r,
+            props: vec![(true, hvcc_r), (false, tb::ispe(64, 64))],
+        },
+    ];
+    let file = tb::make_heic(&items, 1, &[(*b"dimg", 1, vec![2, 3])]);
+    let image = decode_bytes(&file).expect("decode");
+    assert_eq!((image.width, image.height), (100, 50));
+    assert_flat_rgb8(&image, FULL_RANGE_P3_RGB, 1);
+    assert!(image.color.icc_present);
+    assert!(image.color.nclx.is_none());
+}
+
+/// A container nclx box, when present, wins over the bitstream's VUI.
+#[test]
+fn container_nclx_overrides_bitstream_colour() {
+    // single_item_heic attaches a limited-range BT.601 sRGB nclx.
+    let image = decode_bytes(&single_item_heic("flat_full_range_64")).expect("decode");
+    assert_flat_rgb8(&image, [102, 32, 15], 1);
+    assert!(image.color.nclx.is_some());
 }
 
 /// Not a test: writes a small complete `.heic` (the flat-red codestream in

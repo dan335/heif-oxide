@@ -24,7 +24,7 @@ fn as_rgb8(buf: RgbBuffer) -> Vec<u8> {
 }
 
 fn assert_flat_rgb(buf: &[u8], expected: [u8; 3], tolerance: i16) {
-    for px in buf.chunks_exact(3) {
+    for px in buf.as_chunks::<3>().0 {
         for c in 0..3 {
             let diff = (px[c] as i16 - expected[c] as i16).abs();
             assert!(
@@ -156,4 +156,32 @@ fn blit_rejects_odd_offsets() {
     let tile = flat(2, 2, 8, 0, 0, 0);
     assert!(canvas.blit(&tile, 1, 0).is_err());
     assert!(canvas.blit(&tile, 0, 1).is_err());
+}
+
+/// The interpolated transfer tables track the exact sRGB curves to far
+/// better than one 16-bit code value (1/65535 ≈ 1.5e-5), end to end.
+#[test]
+fn srgb_tables_match_exact_curves() {
+    let tables = SrgbTables::get();
+    let samples = 200_003; // not a multiple of the table size
+    for i in 0..=samples {
+        let v = i as f32 / samples as f32;
+        let exact = srgb_to_linear(v);
+        let got = tables.decode(v);
+        assert!(
+            (got - exact).abs() < 1e-6,
+            "to_linear({v}): {got} vs {exact}"
+        );
+        let exact = linear_to_srgb(v);
+        let got = tables.encode(v);
+        assert!(
+            (got - exact).abs() < 1e-6,
+            "from_linear({v}): {got} vs {exact}"
+        );
+    }
+    // Both ends are exact, and nothing indexes past the tables.
+    assert_eq!(tables.decode(0.0), 0.0);
+    assert_eq!(tables.encode(0.0), 0.0);
+    assert!((tables.decode(1.0) - 1.0).abs() < 1e-6);
+    assert!((tables.encode(1.0) - 1.0).abs() < 1e-6);
 }

@@ -8,7 +8,7 @@
 //! item's NALs with each length prefix replaced by a start code — and runs
 //! the decoder over it.
 
-use rust_h265::{parse_annex_b, Decoder, Frame};
+use rust_h265::{parse_annex_b, DecodeLimits, Decoder, Frame};
 
 use crate::bytes::Reader;
 use crate::error::HeifError;
@@ -21,6 +21,19 @@ pub struct HvcConfig {
     /// Parameter-set NAL units (VPS, SPS, PPS, and any prefix SEI), in
     /// record order, without start codes or length prefixes.
     pub parameter_sets: Vec<Vec<u8>>,
+}
+
+/// Read the luma bit depth from an HEVCDecoderConfigurationRecord.
+pub fn hvcc_bit_depth(record: &[u8]) -> Result<u8, HeifError> {
+    let mut r = Reader::new(record, "hvcC");
+    let version = r.u8()?;
+    if version != 1 {
+        return Err(HeifError::Invalid(format!(
+            "hvcC configurationVersion {version} (expected 1)"
+        )));
+    }
+    r.skip(16)?;
+    Ok((r.u8()? & 0x7) + 8)
 }
 
 /// Parse an HEVCDecoderConfigurationRecord.
@@ -95,12 +108,15 @@ pub fn build_annex_b(config: &HvcConfig, item_payload: &[u8]) -> Result<Vec<u8>,
 
 /// Decode a single still picture from an Annex B stream, returning the first
 /// output frame (a HEIF item is exactly one coded picture).
-pub fn decode_first_frame(annex_b: &[u8]) -> Result<Frame, HeifError> {
+pub fn decode_first_frame(annex_b: &[u8], limits: &crate::Limits) -> Result<Frame, HeifError> {
     let nals = parse_annex_b(annex_b);
     if nals.is_empty() {
         return Err(HeifError::Codec("no NAL units in item payload".into()));
     }
-    let mut decoder = Decoder::new();
+    let mut decoder = Decoder::with_limits(DecodeLimits {
+        max_picture_pixels: limits.max_pixels as u64,
+        max_picture_memory_bytes: limits.max_picture_memory_bytes as u64,
+    });
     for nal in &nals {
         match decoder.decode_nal(nal) {
             Ok(Some(frame)) => return Ok(frame),

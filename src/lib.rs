@@ -12,7 +12,9 @@
 //! - Single-picture `hvc1` files from other cameras and encoders.
 //!
 //! Output is display-ready sRGB, 8-bit (`Rgb8`) or 16-bit (`Rgb16`, for
-//! 10/12-bit sources).
+//! 10/12-bit sources). Sample range, matrix and primaries come from the
+//! container's `colr` nclx box or, when a file has none (iPhone photos carry
+//! an ICC profile instead), from the HEVC bitstream's own VUI signalling.
 //!
 //! ```no_run
 //! let image = heif_oxide::decode_file("photo.heic").unwrap();
@@ -20,12 +22,17 @@
 //! let rgba = image.to_rgba8();
 //! ```
 //!
+//! [`read_metadata`] returns the dimensions, bit depth, alpha presence and
+//! colour information without decoding any pixels.
+//!
 //! ## Limitations
 //!
 //! - Decode only — there is no pure-Rust HEVC encoder to pair with.
 //! - Alpha auxiliary images are decoded when they are 4:2:0-coded; the more
 //!   common monochrome (4:0:0) alpha is skipped (the underlying HEVC
-//!   decoder is 4:2:0-only), yielding an image without alpha.
+//!   decoder does not support monochrome), yielding an image without alpha.
+//! - 4:4:4 streams are rejected: rust_h265 decodes them, but this crate's
+//!   colour pipeline is 4:2:0-only.
 //! - AVIF (`av01` payloads) and JPEG-in-HEIF are rejected with a clear
 //!   error, as are protected items and externally-referenced data.
 //! - HDR transfer functions (PQ/HLG) are not tone-mapped; wide-gamut
@@ -36,6 +43,7 @@ mod bytes;
 mod color;
 mod error;
 mod hevc;
+mod sps;
 #[cfg(test)]
 pub(crate) mod test_builder;
 mod transform;
@@ -49,9 +57,32 @@ use color::{RgbBuffer, YuvImage};
 pub use color::Nclx;
 pub use error::HeifError;
 
-const MAX_GRID_TILES: usize = 1024;
-const MAX_IMAGE_PIXELS: usize = 100_000_000;
 const MAX_TRANSFORMS: usize = 4;
+
+/// Resource limits applied before allocating item payloads and decoded pictures.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Limits {
+    /// Maximum pixels in a coded picture or a complete grid canvas, before cropping.
+    pub max_pixels: usize,
+    /// Maximum number of tiles referenced by a grid.
+    pub max_grid_tiles: usize,
+    /// Maximum assembled payload size for each item, including repeated extents.
+    pub max_item_payload_bytes: usize,
+    /// Maximum HEVC-estimated memory for one picture, not the entire decode.
+    pub max_picture_memory_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_pixels: 100_000_000,
+            max_grid_tiles: 1024,
+            max_item_payload_bytes: 256 * 1024 * 1024,
+            max_picture_memory_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
 
 /// Interleaved pixel data. 8-bit sources produce the `*8` variants; 10- and
 /// 12-bit sources produce `*16` (samples scaled to the full 0..65535 range).
@@ -67,10 +98,28 @@ pub enum Pixels {
 /// what conversions were applied. Pixels are always delivered as sRGB.
 #[derive(Debug, Clone, Default)]
 pub struct ColorInfo {
-    /// The `colr` nclx description, if present.
+    /// The `colr` nclx description, if present. When it is absent the
+    /// decoder falls back to the colour signalling inside the HEVC
+    /// bitstream (the SPS VUI), and only then to its defaults (BT.709
+    /// matrix, limited range, sRGB primaries).
     pub nclx: Option<Nclx>,
     /// An ICC profile was present (noted, not applied).
     pub icc_present: bool,
+}
+
+/// Basic information about a HEIF image, read without decoding its pixels.
+#[derive(Debug, Clone)]
+pub struct ImageMetadata {
+    /// Display width after clean-aperture and orientation transforms.
+    pub width: u32,
+    /// Display height after clean-aperture and orientation transforms.
+    pub height: u32,
+    /// Source bits per color sample, normally 8, 10, or 12.
+    pub bit_depth: u8,
+    /// Whether the container declares an alpha auxiliary image.
+    pub has_alpha: bool,
+    /// The container's declared color information.
+    pub color: ColorInfo,
 }
 
 /// A decoded HEIF image: display-ready sRGB with orientation applied.
@@ -112,14 +161,14 @@ impl DecodedImage {
         let mut out = Vec::with_capacity(n * 4);
         match &self.pixels {
             Pixels::Rgb8(v) => {
-                for px in v.chunks_exact(3) {
+                for px in v.as_chunks::<3>().0 {
                     out.extend_from_slice(px);
                     out.push(255);
                 }
             }
             Pixels::Rgba8(v) => out.extend_from_slice(v),
             Pixels::Rgb16(v) => {
-                for px in v.chunks_exact(3) {
+                for px in v.as_chunks::<3>().0 {
                     out.extend(px.iter().map(|&s| (s >> 8) as u8));
                     out.push(255);
                 }
@@ -135,24 +184,89 @@ pub fn decode_file<P: AsRef<Path>>(path: P) -> Result<DecodedImage, HeifError> {
     decode_bytes(&std::fs::read(path)?)
 }
 
+/// Read basic image metadata without decoding the HEVC pixel data.
+pub fn read_metadata(data: &[u8]) -> Result<ImageMetadata, HeifError> {
+    let container = boxes::parse(data)?;
+    let primary = container.primary_item;
+    check_essential_properties(&container, primary)?;
+
+    let (mut width, mut height) = declared_image_size(&container, primary)?;
+    for (_, property) in container.item_properties(primary) {
+        match property {
+            Property::Clap {
+                width_n,
+                width_d,
+                height_n,
+                height_d,
+                ..
+            } => {
+                if *width_d == 0 || *height_d == 0 {
+                    return Err(HeifError::Invalid(
+                        "clean aperture has a zero denominator".into(),
+                    ));
+                }
+                let crop_width = (f64::from(*width_n) / f64::from(*width_d)).round() as u32;
+                let crop_height = (f64::from(*height_n) / f64::from(*height_d)).round() as u32;
+                if crop_width == 0 || crop_height == 0 || crop_width > width || crop_height > height
+                {
+                    return Err(HeifError::Invalid(format!(
+                        "clean aperture {crop_width}x{crop_height} outside image {width}x{height}"
+                    )));
+                }
+                width = crop_width;
+                height = crop_height;
+            }
+            Property::Irot { angle } if angle % 2 == 1 => {
+                std::mem::swap(&mut width, &mut height);
+            }
+            _ => {}
+        }
+    }
+
+    let coded_item = match container.items.get(&primary) {
+        Some(info) if &info.item_type == b"hvc1" => primary,
+        Some(info) if &info.item_type == b"grid" => container
+            .referenced_items(primary, b"dimg")
+            .into_iter()
+            .next()
+            .ok_or_else(|| HeifError::Invalid("grid has no tile references".into()))?,
+        Some(info) => {
+            return Err(HeifError::UnsupportedCodec(bytes::fourcc_str(
+                info.item_type,
+            )))
+        }
+        None => return Err(HeifError::Invalid(format!("item {primary} not in iinf"))),
+    };
+    check_essential_properties(&container, coded_item)?;
+    let bit_depth = container
+        .find_property(coded_item, |property| match property {
+            Property::HvcC(record) => Some(hevc::hvcc_bit_depth(record)),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            HeifError::Invalid(format!("coded item {coded_item} has no hvcC property"))
+        })??;
+
+    Ok(ImageMetadata {
+        width,
+        height,
+        bit_depth,
+        has_alpha: find_alpha_item(&container, primary).is_some(),
+        color: collect_color_info(&container, primary),
+    })
+}
+
 /// Decode a HEIF/HEIC file already in memory.
 pub fn decode_bytes(data: &[u8]) -> Result<DecodedImage, HeifError> {
-    decode_bytes_inner(data, None)
+    decode_bytes_with(data, &Limits::default())
 }
 
-/// Decode an in-memory HEIF/HEIC file whose dimensions must not exceed `max_size`.
-pub fn decode_bytes_with_limit(
-    data: &[u8],
-    max_size: (u32, u32),
-) -> Result<DecodedImage, HeifError> {
-    decode_bytes_inner(data, Some(max_size))
-}
-
-fn decode_bytes_inner(
-    data: &[u8],
-    max_size: Option<(u32, u32)>,
-) -> Result<DecodedImage, HeifError> {
-    let container = boxes::parse(data)?;
+/// Decode an in-memory HEIF/HEIC file with caller-supplied resource limits.
+///
+/// Pixel limits cover coded pictures and the complete grid canvas, before crops
+/// and orientation. HEVC memory limits apply per picture, not to total memory.
+pub fn decode_bytes_with(data: &[u8], limits: &Limits) -> Result<DecodedImage, HeifError> {
+    let container = boxes::parse_with_limits(data, limits.max_item_payload_bytes)?;
     let primary = container.primary_item;
     let transforms: Vec<Property> = container
         .item_properties(primary)
@@ -170,33 +284,24 @@ fn decode_bytes_inner(
             transforms.len()
         )));
     }
-    if let Some((max_width, max_height)) = max_size {
-        let (width, height) = declared_image_size(&container, primary)?;
-        if width > max_width || height > max_height {
-            return Err(HeifError::ImageTooLarge {
-                width,
-                height,
-                max_width,
-                max_height,
-            });
-        }
-    }
-
     // Decode the primary item to a YUV canvas (assembling grid tiles), plus
     // the declared output size the canvas is cropped to.
-    let (yuv, out_w, out_h) = decode_item_yuv(&container, primary)?;
+    let (yuv, out_w, out_h) = decode_item_yuv(&container, primary, limits)?;
 
     // Colour description: the primary (grid) item's colr wins; tiles may
-    // carry their own — used as fallback.
+    // carry their own — used as fallback. Without any nclx box, the coded
+    // picture's own VUI signalling decides.
     let color_info = collect_color_info(&container, primary);
-    let nclx = color_info.nclx.unwrap_or_default();
+    let nclx = color_info
+        .nclx
+        .unwrap_or_else(|| bitstream_nclx(&container, primary));
 
     let rgb = color::yuv_to_rgb(&yuv, &nclx);
 
     // Optional alpha auxiliary image, decoded to a single channel matching
     // the pre-transform geometry. `None` on any failure — alpha is a
     // best-effort enhancement, never a reason to fail the whole file.
-    let alpha = decode_alpha_plane(&container, primary, out_w, out_h);
+    let alpha = decode_alpha_plane(&container, primary, out_w, out_h, limits);
 
     // Finish per storage width: crop the grid canvas to its output size,
     // interleave alpha, apply orientation transforms.
@@ -274,6 +379,41 @@ fn declared_image_size(container: &Container<'_>, item_id: u32) -> Result<(u32, 
         .ok_or_else(|| HeifError::Invalid(format!("image item {item_id} has no ispe property")))
 }
 
+fn check_declared_pixels(
+    container: &Container<'_>,
+    item_id: u32,
+    limits: &Limits,
+) -> Result<(), HeifError> {
+    let info = container
+        .items
+        .get(&item_id)
+        .ok_or_else(|| HeifError::Invalid(format!("item {item_id} not in iinf")))?;
+    if !matches!(&info.item_type, b"hvc1" | b"grid") {
+        return Err(HeifError::UnsupportedCodec(bytes::fourcc_str(
+            info.item_type,
+        )));
+    }
+    let (width, height) = if &info.item_type == b"hvc1" {
+        match container.find_property(item_id, |property| match property {
+            Property::Ispe { width, height } => Some((*width, *height)),
+            _ => None,
+        }) {
+            Some(size) => size,
+            None => return Ok(()),
+        }
+    } else {
+        declared_image_size(container, item_id)?
+    };
+    if u64::from(width) * u64::from(height) > limits.max_pixels as u64 {
+        return Err(HeifError::ImageTooLarge {
+            width,
+            height,
+            max_pixels: limits.max_pixels,
+        });
+    }
+    Ok(())
+}
+
 /// Reject items that carry an *essential* property we don't understand —
 /// the spec forbids processing the item in that case, and silently wrong
 /// output (e.g. an unapplied mandatory transform) is worse than an error.
@@ -298,25 +438,31 @@ fn check_essential_properties(container: &Container<'_>, item_id: u32) -> Result
 fn decode_item_yuv(
     container: &Container<'_>,
     item_id: u32,
+    limits: &Limits,
 ) -> Result<(YuvImage, usize, usize), HeifError> {
     let info = container
         .items
         .get(&item_id)
         .ok_or_else(|| HeifError::Invalid(format!("item {item_id} not in iinf")))?;
     check_essential_properties(container, item_id)?;
+    check_declared_pixels(container, item_id, limits)?;
     match &info.item_type {
         b"hvc1" => {
-            let yuv = decode_coded_item(container, item_id)?;
+            let yuv = decode_coded_item(container, item_id, limits)?;
             let (w, h) = (yuv.width, yuv.height);
             Ok((yuv, w, h))
         }
-        b"grid" => decode_grid(container, item_id),
+        b"grid" => decode_grid(container, item_id, limits),
         other => Err(HeifError::UnsupportedCodec(bytes::fourcc_str(*other))),
     }
 }
 
 /// Decode one `hvc1` coded item via rust_h265.
-fn decode_coded_item(container: &Container<'_>, item_id: u32) -> Result<YuvImage, HeifError> {
+fn decode_coded_item(
+    container: &Container<'_>,
+    item_id: u32,
+    limits: &Limits,
+) -> Result<YuvImage, HeifError> {
     check_essential_properties(container, item_id)?;
     let hvcc_record = container
         .find_property(item_id, |p| match p {
@@ -327,7 +473,7 @@ fn decode_coded_item(container: &Container<'_>, item_id: u32) -> Result<YuvImage
     let config = hevc::parse_hvcc(&hvcc_record)?;
     let payload = container.item_payload(item_id)?;
     let annex_b = hevc::build_annex_b(&config, &payload)?;
-    let frame = hevc::decode_first_frame(&annex_b)?;
+    let frame = hevc::decode_first_frame(&annex_b, limits)?;
     YuvImage::from_frame(&frame)
 }
 
@@ -336,6 +482,7 @@ fn decode_coded_item(container: &Container<'_>, item_id: u32) -> Result<YuvImage
 fn decode_grid(
     container: &Container<'_>,
     item_id: u32,
+    limits: &Limits,
 ) -> Result<(YuvImage, usize, usize), HeifError> {
     // ImageGrid payload (ISO 23008-12 §6.6.2.3.2).
     let payload = container.item_payload(item_id)?;
@@ -354,20 +501,22 @@ fn decode_grid(
         return Err(HeifError::Invalid("grid output size is zero".into()));
     }
 
+    let max_grid_tiles = limits.max_grid_tiles;
+    let max_pixels = limits.max_pixels;
     let tile_count = rows
         .checked_mul(cols)
-        .filter(|&count| count <= MAX_GRID_TILES)
+        .filter(|&count| count <= max_grid_tiles)
         .ok_or_else(|| {
             HeifError::Invalid(format!(
-                "grid declares {rows}x{cols} tiles; maximum is {MAX_GRID_TILES}"
+                "grid declares {rows}x{cols} tiles; maximum is {max_grid_tiles}"
             ))
         })?;
     out_w
         .checked_mul(out_h)
-        .filter(|&pixels| pixels <= MAX_IMAGE_PIXELS)
+        .filter(|&pixels| pixels <= max_pixels)
         .ok_or_else(|| {
             HeifError::Invalid(format!(
-                "grid output {out_w}x{out_h} exceeds {MAX_IMAGE_PIXELS} pixels"
+                "grid output {out_w}x{out_h} exceeds {max_pixels} pixels"
             ))
         })?;
 
@@ -389,37 +538,50 @@ fn decode_grid(
         let (width, height) = declared_image_size(container, *tile)?;
         declared_tile_pixels = declared_tile_pixels
             .checked_add(u64::from(width) * u64::from(height))
-            .filter(|&pixels| pixels <= MAX_IMAGE_PIXELS as u64)
+            .filter(|&pixels| pixels <= max_pixels as u64)
             .ok_or_else(|| {
-                HeifError::Invalid(format!("grid tile images exceed {MAX_IMAGE_PIXELS} pixels"))
+                HeifError::Invalid(format!("grid tile images exceed {max_pixels} pixels"))
             })?;
     }
 
-    // Decode all tiles, splitting the list across the available cores —
-    // each tile is an independent HEVC codestream. Results land in a
-    // pre-sized Vec via disjoint per-thread chunks (no locking).
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let chunk_size = tiles.len().div_ceil(threads).max(1);
-    let mut results: Vec<Option<Result<YuvImage, HeifError>>> = Vec::new();
-    results.resize_with(tiles.len(), || None);
-    std::thread::scope(|s| {
-        for (tile_chunk, result_chunk) in
-            tiles.chunks(chunk_size).zip(results.chunks_mut(chunk_size))
-        {
-            s.spawn(move || {
-                for (tile_id, slot) in tile_chunk.iter().zip(result_chunk.iter_mut()) {
-                    *slot = Some(decode_coded_item(container, *tile_id));
-                }
-            });
-        }
-    });
+    // Tiles must have identical geometry; bound their combined allocation even
+    // when their declared sizes understate the bitstream dimensions.
+    let mut tile_limits = limits.clone();
+    tile_limits.max_pixels /= tile_count;
+    let tile_limits = &tile_limits;
 
-    let mut decoded = Vec::with_capacity(tiles.len());
-    for slot in results {
-        decoded.push(slot.expect("every tile chunk was processed")?);
-    }
+    #[cfg(target_family = "wasm")]
+    let decoded = tiles
+        .iter()
+        .map(|tile_id| decode_coded_item(container, *tile_id, tile_limits))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    #[cfg(not(target_family = "wasm"))]
+    let decoded = {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = tiles.len().div_ceil(threads).max(1);
+        let mut results: Vec<Option<Result<YuvImage, HeifError>>> = Vec::new();
+        results.resize_with(tiles.len(), || None);
+        std::thread::scope(|s| {
+            for (tile_chunk, result_chunk) in
+                tiles.chunks(chunk_size).zip(results.chunks_mut(chunk_size))
+            {
+                s.spawn(move || {
+                    for (tile_id, slot) in tile_chunk.iter().zip(result_chunk.iter_mut()) {
+                        *slot = Some(decode_coded_item(container, *tile_id, tile_limits));
+                    }
+                });
+            }
+        });
+
+        let mut decoded = Vec::with_capacity(tiles.len());
+        for slot in results {
+            decoded.push(slot.expect("every tile chunk was processed")?);
+        }
+        decoded
+    };
 
     // All tiles must agree on geometry; the canvas is a whole number of
     // tiles, cropped to (out_w, out_h) later in RGB space.
@@ -439,10 +601,10 @@ fn decode_grid(
         .ok_or_else(|| HeifError::Invalid("grid canvas height overflows".into()))?;
     canvas_w
         .checked_mul(canvas_h)
-        .filter(|&pixels| pixels <= MAX_IMAGE_PIXELS)
+        .filter(|&pixels| pixels <= max_pixels)
         .ok_or_else(|| {
             HeifError::Invalid(format!(
-                "grid canvas {canvas_w}x{canvas_h} exceeds {MAX_IMAGE_PIXELS} pixels"
+                "grid canvas {canvas_w}x{canvas_h} exceeds {max_pixels} pixels"
             ))
         })?;
     if canvas_w < out_w || canvas_h < out_h {
@@ -494,32 +656,92 @@ fn collect_color_info(container: &Container<'_>, primary: u32) -> ColorInfo {
     info
 }
 
+fn find_alpha_item(container: &Container<'_>, primary: u32) -> Option<u32> {
+    container
+        .references
+        .iter()
+        .find(|reference| {
+            &reference.ref_type == b"auxl"
+                && reference.to_items.contains(&primary)
+                && container
+                    .find_property(reference.from_item, |property| match property {
+                        Property::AuxC(urn) => {
+                            Some(urn.contains("alpha") || urn == "urn:mpeg:hevc:2015:auxid:1")
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(false)
+        })
+        .map(|reference| reference.from_item)
+}
+
+/// Colour description for a file with no `colr` nclx box: whatever the
+/// coded picture's SPS VUI signals (H.265 §E.2.1), over the defaults.
+///
+/// iPhone photos are the common case — they carry an ICC profile instead of
+/// nclx, and their bitstream says full range, BT.601 matrix, Display P3
+/// primaries. Treating them as the limited-range default crushes shadows
+/// and clips highlights.
+///
+/// Best-effort: a missing or unparseable SPS leaves the defaults in place.
+fn bitstream_nclx(container: &Container<'_>, primary: u32) -> Nclx {
+    /// CICP code point meaning "unspecified" — carries no information.
+    const UNSPECIFIED: u8 = 2;
+
+    let mut nclx = Nclx::default();
+    // The coded picture is the primary item itself, or — for a grid — its
+    // first tile (tiles of one grid share their coding parameters).
+    let coded_item = match container.items.get(&primary) {
+        Some(info) if &info.item_type == b"grid" => container
+            .referenced_items(primary, b"dimg")
+            .first()
+            .copied(),
+        Some(_) => Some(primary),
+        None => None,
+    };
+    let vui = coded_item
+        .and_then(|item| {
+            container.find_property(item, |p| match p {
+                Property::HvcC(record) => Some(record.clone()),
+                _ => None,
+            })
+        })
+        .and_then(|record| hevc::parse_hvcc(&record).ok())
+        .and_then(|config| {
+            config
+                .parameter_sets
+                .iter()
+                .find(|nal| sps::is_sps(nal))
+                .and_then(|nal| sps::vui_colour(nal))
+        });
+    if let Some(vui) = vui {
+        nclx.full_range = vui.full_range;
+        if let Some((primaries, transfer, matrix)) = vui.description {
+            if primaries != UNSPECIFIED {
+                nclx.primaries = u16::from(primaries);
+            }
+            if transfer != UNSPECIFIED {
+                nclx.transfer = u16::from(transfer);
+            }
+            if matrix != UNSPECIFIED {
+                nclx.matrix = u16::from(matrix);
+            }
+        }
+    }
+    nclx
+}
+
 /// Try to decode an alpha auxiliary image into a u16 plane (full-scale
-/// 0..65535) matching the master's pre-transform output size. Any failure —
-/// including the common monochrome-HEVC alpha rust_h265 can't decode —
-/// returns `None` and the image ships without alpha.
+/// 0..65535) matching the master's pre-transform output size.
 fn decode_alpha_plane(
     container: &Container<'_>,
     primary: u32,
     out_w: usize,
     out_h: usize,
+    limits: &Limits,
 ) -> Option<Vec<u16>> {
-    // An alpha auxiliary points AT the image it augments: find an item
-    // whose `auxl` reference targets the primary and whose auxC URN says
-    // it's alpha.
-    let aux_item = container.references.iter().find(|r| {
-        &r.ref_type == b"auxl"
-            && r.to_items.contains(&primary)
-            && container
-                .find_property(r.from_item, |p| match p {
-                    Property::AuxC(urn) => {
-                        Some(urn.contains("alpha") || urn == "urn:mpeg:hevc:2015:auxid:1")
-                    }
-                    _ => None,
-                })
-                .unwrap_or(false)
-    })?;
-    let (yuv, aux_w, aux_h) = decode_item_yuv(container, aux_item.from_item).ok()?;
+    let aux_item = find_alpha_item(container, primary)?;
+    let (yuv, aux_w, aux_h) = decode_item_yuv(container, aux_item, limits).ok()?;
     if aux_w != out_w || aux_h != out_h {
         return None;
     }
@@ -538,7 +760,7 @@ fn decode_alpha_plane(
 /// Interleave a u16 alpha plane into an 8-bit RGB buffer.
 fn interleave_alpha8(rgb: &[u8], alpha: &[u16]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
-    for (px, &a) in rgb.chunks_exact(3).zip(alpha.iter()) {
+    for (px, &a) in rgb.as_chunks::<3>().0.iter().zip(alpha.iter()) {
         out.extend_from_slice(px);
         out.push((a >> 8) as u8);
     }
@@ -548,7 +770,7 @@ fn interleave_alpha8(rgb: &[u8], alpha: &[u16]) -> Vec<u8> {
 /// Interleave a u16 alpha plane into a 16-bit RGB buffer.
 fn interleave_alpha16(rgb: &[u16], alpha: &[u16]) -> Vec<u16> {
     let mut out = Vec::with_capacity(rgb.len() / 3 * 4);
-    for (px, &a) in rgb.chunks_exact(3).zip(alpha.iter()) {
+    for (px, &a) in rgb.as_chunks::<3>().0.iter().zip(alpha.iter()) {
         out.extend_from_slice(px);
         out.push(a);
     }

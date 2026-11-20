@@ -3,7 +3,8 @@
 //! Decoded HEVC frames arrive as planar YCbCr 4:2:0 (8- or 10/12-bit). This
 //! module holds them in a uniform u16-plane representation (so grid tiles can
 //! be blitted into one canvas regardless of storage width), then converts to
-//! interleaved RGB using the `colr`/nclx colour description:
+//! interleaved RGB using the `colr`/nclx colour description (or, when the
+//! container has none, the equivalent fields from the HEVC SPS VUI):
 //!
 //! - matrix coefficients (BT.601 / BT.709 / BT.2020) and full/limited range
 //!   select the YCbCr→R'G'B' math;
@@ -85,6 +86,14 @@ impl YuvImage {
     /// Wrap a decoded `rust_h265::Frame`, normalizing both storage widths to
     /// u16 and validating the plane sizes the container promised.
     pub fn from_frame(frame: &Frame) -> Result<Self, HeifError> {
+        // rust_h265 also decodes 4:4:4 (`chroma_format_idc` 3), but the
+        // canvas, blit and colour conversion below are 4:2:0-only.
+        if frame.chroma_format_idc != 1 {
+            return Err(HeifError::Unsupported(format!(
+                "HEVC chroma_format_idc {} (only 4:2:0 is supported)",
+                frame.chroma_format_idc
+            )));
+        }
         let width = frame.width as usize;
         let height = frame.height as usize;
         let cw = width.div_ceil(2);
@@ -120,7 +129,7 @@ impl YuvImage {
     /// the 4:2:0 chroma grids stay aligned — grid tiling guarantees this
     /// for every sane file (tile offsets are multiples of the tile size).
     pub fn blit(&mut self, tile: &YuvImage, x: usize, y: usize) -> Result<(), HeifError> {
-        if x % 2 != 0 || y % 2 != 0 {
+        if !x.is_multiple_of(2) || !y.is_multiple_of(2) {
             return Err(HeifError::Unsupported(
                 "grid tiles at odd offsets (chroma grids misaligned)".into(),
             ));
@@ -188,6 +197,58 @@ fn linear_to_srgb(v: f32) -> f32 {
     }
 }
 
+/// Interpolated lookup tables for the two sRGB transfer curves.
+///
+/// The gamut conversion needs three decodes and three encodes per pixel.
+/// Calling `powf` for each one adds roughly half again to the time of a
+/// whole 24-megapixel decode; linear interpolation over these tables
+/// reproduces the exact curves to well under 1/100 of a 16-bit code value.
+struct SrgbTables {
+    /// `srgb_to_linear(i / STEPS)`.
+    to_linear: Vec<f32>,
+    /// `linear_to_srgb((i / STEPS)²)`. Indexing by the square root of the
+    /// linear value flattens the curve's steep start, so a uniformly
+    /// spaced table stays accurate in the shadows.
+    from_linear_sqrt: Vec<f32>,
+}
+
+impl SrgbTables {
+    /// Intervals per table (each table has `STEPS + 1` entries).
+    const STEPS: usize = 4096;
+
+    /// The process-wide tables, built on first use.
+    fn get() -> &'static SrgbTables {
+        static TABLES: std::sync::OnceLock<SrgbTables> = std::sync::OnceLock::new();
+        TABLES.get_or_init(|| {
+            let at = |i: usize| i as f32 / Self::STEPS as f32;
+            SrgbTables {
+                to_linear: (0..=Self::STEPS).map(|i| srgb_to_linear(at(i))).collect(),
+                from_linear_sqrt: (0..=Self::STEPS)
+                    .map(|i| linear_to_srgb(at(i) * at(i)))
+                    .collect(),
+            }
+        })
+    }
+
+    /// Interpolate `table` at `position`, which must be within 0.0..=1.0.
+    fn lookup(table: &[f32], position: f32) -> f32 {
+        let scaled = position * Self::STEPS as f32;
+        let index = (scaled as usize).min(Self::STEPS - 1);
+        let low = table[index];
+        low + (table[index + 1] - low) * (scaled - index as f32)
+    }
+
+    /// sRGB EOTF for a value within 0.0..=1.0.
+    fn decode(&self, v: f32) -> f32 {
+        Self::lookup(&self.to_linear, v)
+    }
+
+    /// sRGB OETF for a value within 0.0..=1.0.
+    fn encode(&self, v: f32) -> f32 {
+        Self::lookup(&self.from_linear_sqrt, v.sqrt())
+    }
+}
+
 /// Linear-light RGB→RGB matrix converting the tagged primaries to sRGB,
 /// or `None` when the pixels are already sRGB (or we don't know better).
 fn primaries_to_srgb_matrix(primaries: u16) -> Option<[[f32; 3]; 3]> {
@@ -218,6 +279,7 @@ pub fn yuv_to_rgb(img: &YuvImage, nclx: &Nclx) -> RgbBuffer {
     let scale = (1u32 << (img.bit_depth - 8)) as f32;
     let max = ((1u32 << img.bit_depth) - 1) as f32;
     let primaries_matrix = primaries_to_srgb_matrix(nclx.primaries);
+    let srgb = SrgbTables::get();
 
     // Range expansion: limited range puts Y in [16..235]*2^(d-8) and chroma
     // in [16..240]*2^(d-8); full range uses the whole code range.
@@ -293,18 +355,12 @@ pub fn yuv_to_rgb(img: &YuvImage, nclx: &Nclx) -> RgbBuffer {
                 if let Some(m) = &primaries_matrix {
                     // Convert wide-gamut primaries to sRGB through linear
                     // light, clamping out-of-gamut results.
-                    let rl = srgb_to_linear(r.clamp(0.0, 1.0));
-                    let gl = srgb_to_linear(g.clamp(0.0, 1.0));
-                    let bl = srgb_to_linear(b.clamp(0.0, 1.0));
-                    r = linear_to_srgb(
-                        (m[0][0] * rl + m[0][1] * gl + m[0][2] * bl).clamp(0.0, 1.0),
-                    );
-                    g = linear_to_srgb(
-                        (m[1][0] * rl + m[1][1] * gl + m[1][2] * bl).clamp(0.0, 1.0),
-                    );
-                    b = linear_to_srgb(
-                        (m[2][0] * rl + m[2][1] * gl + m[2][2] * bl).clamp(0.0, 1.0),
-                    );
+                    let rl = srgb.decode(r.clamp(0.0, 1.0));
+                    let gl = srgb.decode(g.clamp(0.0, 1.0));
+                    let bl = srgb.decode(b.clamp(0.0, 1.0));
+                    r = srgb.encode((m[0][0] * rl + m[0][1] * gl + m[0][2] * bl).clamp(0.0, 1.0));
+                    g = srgb.encode((m[1][0] * rl + m[1][1] * gl + m[1][2] * bl).clamp(0.0, 1.0));
+                    b = srgb.encode((m[2][0] * rl + m[2][1] * gl + m[2][2] * bl).clamp(0.0, 1.0));
                 }
 
                 let i = local_row * w * 3 + x * 3;
@@ -321,36 +377,51 @@ pub fn yuv_to_rgb(img: &YuvImage, nclx: &Nclx) -> RgbBuffer {
         }
     };
 
-    // Split the output into per-thread row strips and convert in parallel.
-    // The closure is shared by reference so each spawned thread can call it.
-    let convert_rows = &convert_rows;
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    let rows_per_strip = ((img.height + threads - 1) / threads.max(1)).max(1);
     if is_8bit {
-        let strips: Vec<(usize, &mut [u8])> = out8
-            .chunks_mut(rows_per_strip * w * 3)
-            .enumerate()
-            .map(|(i, c)| (i * rows_per_strip, c))
-            .collect();
-        std::thread::scope(|s| {
-            for (row_start, strip) in strips {
-                s.spawn(move || convert_rows(row_start, strip, &mut []));
-            }
-        });
+        #[cfg(target_family = "wasm")]
+        convert_rows(0, &mut out8, &mut []);
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let convert_rows = &convert_rows;
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let rows_per_strip = ((img.height + threads - 1) / threads.max(1)).max(1);
+            let strips: Vec<(usize, &mut [u8])> = out8
+                .chunks_mut(rows_per_strip * w * 3)
+                .enumerate()
+                .map(|(i, c)| (i * rows_per_strip, c))
+                .collect();
+            std::thread::scope(|s| {
+                for (row_start, strip) in strips {
+                    s.spawn(move || convert_rows(row_start, strip, &mut []));
+                }
+            });
+        }
         RgbBuffer::Rgb8(out8)
     } else {
-        let strips: Vec<(usize, &mut [u16])> = out16
-            .chunks_mut(rows_per_strip * w * 3)
-            .enumerate()
-            .map(|(i, c)| (i * rows_per_strip, c))
-            .collect();
-        std::thread::scope(|s| {
-            for (row_start, strip) in strips {
-                s.spawn(move || convert_rows(row_start, &mut [], strip));
-            }
-        });
+        #[cfg(target_family = "wasm")]
+        convert_rows(0, &mut [], &mut out16);
+
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let convert_rows = &convert_rows;
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let rows_per_strip = ((img.height + threads - 1) / threads.max(1)).max(1);
+            let strips: Vec<(usize, &mut [u16])> = out16
+                .chunks_mut(rows_per_strip * w * 3)
+                .enumerate()
+                .map(|(i, c)| (i * rows_per_strip, c))
+                .collect();
+            std::thread::scope(|s| {
+                for (row_start, strip) in strips {
+                    s.spawn(move || convert_rows(row_start, &mut [], strip));
+                }
+            });
+        }
         RgbBuffer::Rgb16(out16)
     }
 }

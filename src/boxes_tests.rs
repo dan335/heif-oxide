@@ -177,6 +177,7 @@ fn rejects_amplified_iloc_payload() {
     );
     let container = Container {
         data: &data,
+        max_item_payload_bytes: crate::Limits::default().max_item_payload_bytes,
         primary_item: 1,
         items,
         locations,

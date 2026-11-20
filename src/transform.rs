@@ -99,11 +99,12 @@ fn rotate<T: Copy + Default>(
     (out, out_w, out_h)
 }
 
-/// Mirror about a vertical axis (axis 0: left↔right) or horizontal axis
-/// (axis 1: top↔bottom).
+/// Mirror per `imir`: axis 0 exchanges the top and bottom of the image,
+/// axis 1 exchanges left and right (ISO/IEC 23008-12 §6.5.12, as amended —
+/// the convention libheif and Apple's decoders implement).
 fn mirror<T: Copy>(pixels: &[T], width: usize, height: usize, channels: usize, axis: u8) -> Vec<T> {
     let mut out = pixels.to_vec();
-    if axis == 0 {
+    if axis != 0 {
         for y in 0..height {
             for x in 0..width {
                 let src = (y * width + (width - 1 - x)) * channels;
