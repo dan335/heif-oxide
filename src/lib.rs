@@ -48,6 +48,7 @@ mod sps;
 pub(crate) mod test_builder;
 mod transform;
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use boxes::{ColorProperty, Container, Property};
@@ -55,6 +56,33 @@ use color::{RgbBuffer, YuvImage};
 
 pub use color::Nclx;
 pub use error::HeifError;
+
+const MAX_TRANSFORMS: usize = 4;
+
+/// Resource limits applied before allocating item payloads and decoded pictures.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Limits {
+    /// Maximum pixels in a coded picture or a complete grid canvas, before cropping.
+    pub max_pixels: usize,
+    /// Maximum number of tiles referenced by a grid.
+    pub max_grid_tiles: usize,
+    /// Maximum assembled payload size for each item, including repeated extents.
+    pub max_item_payload_bytes: usize,
+    /// Maximum HEVC-estimated memory for one picture, not the entire decode.
+    pub max_picture_memory_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_pixels: 100_000_000,
+            max_grid_tiles: 1024,
+            max_item_payload_bytes: 256 * 1024 * 1024,
+            max_picture_memory_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
 
 /// Interleaved pixel data. 8-bit sources produce the `*8` variants; 10- and
 /// 12-bit sources produce `*16` (samples scaled to the full 0..65535 range).
@@ -230,12 +258,35 @@ pub fn read_metadata(data: &[u8]) -> Result<ImageMetadata, HeifError> {
 
 /// Decode a HEIF/HEIC file already in memory.
 pub fn decode_bytes(data: &[u8]) -> Result<DecodedImage, HeifError> {
-    let container = boxes::parse(data)?;
-    let primary = container.primary_item;
+    decode_bytes_with(data, &Limits::default())
+}
 
+/// Decode an in-memory HEIF/HEIC file with caller-supplied resource limits.
+///
+/// Pixel limits cover coded pictures and the complete grid canvas, before crops
+/// and orientation. HEVC memory limits apply per picture, not to total memory.
+pub fn decode_bytes_with(data: &[u8], limits: &Limits) -> Result<DecodedImage, HeifError> {
+    let container = boxes::parse_with_limits(data, limits.max_item_payload_bytes)?;
+    let primary = container.primary_item;
+    let transforms: Vec<Property> = container
+        .item_properties(primary)
+        .filter(|(_, property)| {
+            matches!(
+                property,
+                Property::Clap { .. } | Property::Irot { .. } | Property::Imir { .. }
+            )
+        })
+        .map(|(_, property)| property.clone())
+        .collect();
+    if transforms.len() > MAX_TRANSFORMS {
+        return Err(HeifError::Invalid(format!(
+            "image item {primary} has {} transforms; maximum is {MAX_TRANSFORMS}",
+            transforms.len()
+        )));
+    }
     // Decode the primary item to a YUV canvas (assembling grid tiles), plus
     // the declared output size the canvas is cropped to.
-    let (yuv, out_w, out_h) = decode_item_yuv(&container, primary)?;
+    let (yuv, out_w, out_h) = decode_item_yuv(&container, primary, limits)?;
 
     // Colour description: the primary (grid) item's colr wins; tiles may
     // carry their own — used as fallback. Without any nclx box, the coded
@@ -247,22 +298,10 @@ pub fn decode_bytes(data: &[u8]) -> Result<DecodedImage, HeifError> {
 
     let rgb = color::yuv_to_rgb(&yuv, &nclx);
 
-    // The primary item's transformative properties, in association order.
-    let transforms: Vec<Property> = container
-        .item_properties(primary)
-        .filter(|(_, p)| {
-            matches!(
-                p,
-                Property::Clap { .. } | Property::Irot { .. } | Property::Imir { .. }
-            )
-        })
-        .map(|(_, p)| p.clone())
-        .collect();
-
     // Optional alpha auxiliary image, decoded to a single channel matching
     // the pre-transform geometry. `None` on any failure — alpha is a
     // best-effort enhancement, never a reason to fail the whole file.
-    let alpha = decode_alpha_plane(&container, primary, out_w, out_h);
+    let alpha = decode_alpha_plane(&container, primary, out_w, out_h, limits);
 
     // Finish per storage width: crop the grid canvas to its output size,
     // interleave alpha, apply orientation transforms.
@@ -340,6 +379,41 @@ fn declared_image_size(container: &Container<'_>, item_id: u32) -> Result<(u32, 
         .ok_or_else(|| HeifError::Invalid(format!("image item {item_id} has no ispe property")))
 }
 
+fn check_declared_pixels(
+    container: &Container<'_>,
+    item_id: u32,
+    limits: &Limits,
+) -> Result<(), HeifError> {
+    let info = container
+        .items
+        .get(&item_id)
+        .ok_or_else(|| HeifError::Invalid(format!("item {item_id} not in iinf")))?;
+    if !matches!(&info.item_type, b"hvc1" | b"grid") {
+        return Err(HeifError::UnsupportedCodec(bytes::fourcc_str(
+            info.item_type,
+        )));
+    }
+    let (width, height) = if &info.item_type == b"hvc1" {
+        match container.find_property(item_id, |property| match property {
+            Property::Ispe { width, height } => Some((*width, *height)),
+            _ => None,
+        }) {
+            Some(size) => size,
+            None => return Ok(()),
+        }
+    } else {
+        declared_image_size(container, item_id)?
+    };
+    if u64::from(width) * u64::from(height) > limits.max_pixels as u64 {
+        return Err(HeifError::ImageTooLarge {
+            width,
+            height,
+            max_pixels: limits.max_pixels,
+        });
+    }
+    Ok(())
+}
+
 /// Reject items that carry an *essential* property we don't understand —
 /// the spec forbids processing the item in that case, and silently wrong
 /// output (e.g. an unapplied mandatory transform) is worse than an error.
@@ -364,25 +438,31 @@ fn check_essential_properties(container: &Container<'_>, item_id: u32) -> Result
 fn decode_item_yuv(
     container: &Container<'_>,
     item_id: u32,
+    limits: &Limits,
 ) -> Result<(YuvImage, usize, usize), HeifError> {
     let info = container
         .items
         .get(&item_id)
         .ok_or_else(|| HeifError::Invalid(format!("item {item_id} not in iinf")))?;
     check_essential_properties(container, item_id)?;
+    check_declared_pixels(container, item_id, limits)?;
     match &info.item_type {
         b"hvc1" => {
-            let yuv = decode_coded_item(container, item_id)?;
+            let yuv = decode_coded_item(container, item_id, limits)?;
             let (w, h) = (yuv.width, yuv.height);
             Ok((yuv, w, h))
         }
-        b"grid" => decode_grid(container, item_id),
+        b"grid" => decode_grid(container, item_id, limits),
         other => Err(HeifError::UnsupportedCodec(bytes::fourcc_str(*other))),
     }
 }
 
 /// Decode one `hvc1` coded item via rust_h265.
-fn decode_coded_item(container: &Container<'_>, item_id: u32) -> Result<YuvImage, HeifError> {
+fn decode_coded_item(
+    container: &Container<'_>,
+    item_id: u32,
+    limits: &Limits,
+) -> Result<YuvImage, HeifError> {
     check_essential_properties(container, item_id)?;
     let hvcc_record = container
         .find_property(item_id, |p| match p {
@@ -393,7 +473,7 @@ fn decode_coded_item(container: &Container<'_>, item_id: u32) -> Result<YuvImage
     let config = hevc::parse_hvcc(&hvcc_record)?;
     let payload = container.item_payload(item_id)?;
     let annex_b = hevc::build_annex_b(&config, &payload)?;
-    let frame = hevc::decode_first_frame(&annex_b)?;
+    let frame = hevc::decode_first_frame(&annex_b, limits)?;
     YuvImage::from_frame(&frame)
 }
 
@@ -402,6 +482,7 @@ fn decode_coded_item(container: &Container<'_>, item_id: u32) -> Result<YuvImage
 fn decode_grid(
     container: &Container<'_>,
     item_id: u32,
+    limits: &Limits,
 ) -> Result<(YuvImage, usize, usize), HeifError> {
     // ImageGrid payload (ISO 23008-12 §6.6.2.3.2).
     let payload = container.item_payload(item_id)?;
@@ -420,18 +501,59 @@ fn decode_grid(
         return Err(HeifError::Invalid("grid output size is zero".into()));
     }
 
+    let max_grid_tiles = limits.max_grid_tiles;
+    let max_pixels = limits.max_pixels;
+    let tile_count = rows
+        .checked_mul(cols)
+        .filter(|&count| count <= max_grid_tiles)
+        .ok_or_else(|| {
+            HeifError::Invalid(format!(
+                "grid declares {rows}x{cols} tiles; maximum is {max_grid_tiles}"
+            ))
+        })?;
+    out_w
+        .checked_mul(out_h)
+        .filter(|&pixels| pixels <= max_pixels)
+        .ok_or_else(|| {
+            HeifError::Invalid(format!(
+                "grid output {out_w}x{out_h} exceeds {max_pixels} pixels"
+            ))
+        })?;
+
     let tiles = container.referenced_items(item_id, b"dimg");
-    if tiles.len() != rows * cols {
+    if tiles.len() != tile_count {
         return Err(HeifError::Invalid(format!(
             "grid declares {rows}x{cols} tiles but references {}",
             tiles.len()
         )));
     }
+    let mut unique_tiles = HashSet::with_capacity(tiles.len());
+    if tiles.iter().any(|tile| !unique_tiles.insert(*tile)) {
+        return Err(HeifError::Invalid(
+            "grid contains duplicate tile references".into(),
+        ));
+    }
+    let mut declared_tile_pixels = 0u64;
+    for tile in &tiles {
+        let (width, height) = declared_image_size(container, *tile)?;
+        declared_tile_pixels = declared_tile_pixels
+            .checked_add(u64::from(width) * u64::from(height))
+            .filter(|&pixels| pixels <= max_pixels as u64)
+            .ok_or_else(|| {
+                HeifError::Invalid(format!("grid tile images exceed {max_pixels} pixels"))
+            })?;
+    }
+
+    // Tiles must have identical geometry; bound their combined allocation even
+    // when their declared sizes understate the bitstream dimensions.
+    let mut tile_limits = limits.clone();
+    tile_limits.max_pixels /= tile_count;
+    let tile_limits = &tile_limits;
 
     #[cfg(target_family = "wasm")]
     let decoded = tiles
         .iter()
-        .map(|tile_id| decode_coded_item(container, *tile_id))
+        .map(|tile_id| decode_coded_item(container, *tile_id, tile_limits))
         .collect::<Result<Vec<_>, _>>()?;
 
     #[cfg(not(target_family = "wasm"))]
@@ -448,7 +570,7 @@ fn decode_grid(
             {
                 s.spawn(move || {
                     for (tile_id, slot) in tile_chunk.iter().zip(result_chunk.iter_mut()) {
-                        *slot = Some(decode_coded_item(container, *tile_id));
+                        *slot = Some(decode_coded_item(container, *tile_id, tile_limits));
                     }
                 });
             }
@@ -471,14 +593,26 @@ fn decode_grid(
     {
         return Err(HeifError::Invalid("grid tiles have differing sizes".into()));
     }
-    if tile_w * cols < out_w || tile_h * rows < out_h {
+    let canvas_w = tile_w
+        .checked_mul(cols)
+        .ok_or_else(|| HeifError::Invalid("grid canvas width overflows".into()))?;
+    let canvas_h = tile_h
+        .checked_mul(rows)
+        .ok_or_else(|| HeifError::Invalid("grid canvas height overflows".into()))?;
+    canvas_w
+        .checked_mul(canvas_h)
+        .filter(|&pixels| pixels <= max_pixels)
+        .ok_or_else(|| {
+            HeifError::Invalid(format!(
+                "grid canvas {canvas_w}x{canvas_h} exceeds {max_pixels} pixels"
+            ))
+        })?;
+    if canvas_w < out_w || canvas_h < out_h {
         return Err(HeifError::Invalid(format!(
-            "grid canvas {}x{} smaller than declared output {out_w}x{out_h}",
-            tile_w * cols,
-            tile_h * rows
+            "grid canvas {canvas_w}x{canvas_h} smaller than declared output {out_w}x{out_h}"
         )));
     }
-    let mut canvas = YuvImage::black(tile_w * cols, tile_h * rows, decoded[0].bit_depth);
+    let mut canvas = YuvImage::black(canvas_w, canvas_h, decoded[0].bit_depth);
     for (i, tile) in decoded.iter().enumerate() {
         canvas.blit(tile, (i % cols) * tile_w, (i / cols) * tile_h)?;
     }
@@ -604,9 +738,10 @@ fn decode_alpha_plane(
     primary: u32,
     out_w: usize,
     out_h: usize,
+    limits: &Limits,
 ) -> Option<Vec<u16>> {
     let aux_item = find_alpha_item(container, primary)?;
-    let (yuv, aux_w, aux_h) = decode_item_yuv(container, aux_item).ok()?;
+    let (yuv, aux_w, aux_h) = decode_item_yuv(container, aux_item, limits).ok()?;
     if aux_w != out_w || aux_h != out_h {
         return None;
     }

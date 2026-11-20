@@ -26,6 +26,49 @@ let metadata = heif_oxide::read_metadata(&data)?;
 println!("{}x{}, {}-bit", metadata.width, metadata.height, metadata.bit_depth);
 ```
 
+## Decode limits
+
+`decode_bytes` and `decode_file` use `Limits::default()`. Use
+`decode_bytes_with(data: &[u8], limits: &Limits)` to customize the limits:
+
+```rust
+let data = std::fs::read("photo.heic")?;
+let mut limits = heif_oxide::Limits::default();
+limits.max_pixels = 24_000_000;
+limits.max_grid_tiles = 256;
+let image = heif_oxide::decode_bytes_with(&data, &limits)?;
+```
+
+`Limits` is non-exhaustive: construct it with `Default` and then set the
+public fields rather than using a struct literal. It implements `Debug`
+and `Clone`. All limits are `usize` values:
+
+| Field | Default | Bounds |
+| --- | --- | --- |
+| `max_pixels` | `100_000_000` | Declared image size, actual HEVC pictures, grid tile aggregate and canvas |
+| `max_grid_tiles` | `1024` | Number of tiles in a grid |
+| `max_item_payload_bytes` | `256 * 1024 * 1024` (256 MiB) | Payload bytes assembled for one item |
+| `max_picture_memory_bytes` | `1024 * 1024 * 1024` (1 GiB) | HEVC decoder memory per picture |
+
+Pixel limits are enforced against HEVC bitstream dimensions as well as
+container declarations, so a small or spoofed `ispe` does not bypass them.
+For grids, `max_pixels` counts the full, uncropped canvas and the aggregate
+actual tile pixels, even when the declared output is much smaller.
+The picture-memory limit is **per picture**, not a total budget for a decode:
+parallel grid tiles, the assembled canvas, RGB output, and transforms can
+consume additional memory. Alpha is best-effort; an auxiliary image that
+fails decoding or exceeds its limits may be omitted.
+
+Declared image sizes above `max_pixels` return
+`HeifError::ImageTooLarge { width, height, max_pixels }`. HEVC decoder limit
+violations may return `HeifError::Codec`; invalid grid aggregates and other
+container resource violations return `HeifError::Invalid`. `HeifError` is
+non-exhaustive, so downstream matches need a wildcard arm.
+
+This replaces `decode_bytes_with_limit(data, (max_width, max_height))`
+with `decode_bytes_with(data, &limits)`. The new size bound is a pixel count,
+not separate width and height bounds.
+
 ## What works
 
 | Feature | Status |

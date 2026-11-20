@@ -5,6 +5,7 @@
 /// Malformed or unsupported input always surfaces as an `Err` — the decoder
 /// never panics on untrusted bytes.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum HeifError {
     /// Reading the file from disk failed.
     #[error("failed to read file: {0}")]
@@ -40,6 +41,14 @@ pub enum HeifError {
     /// indices, mismatched grid tiles, ...).
     #[error("invalid HEIF structure: {0}")]
     Invalid(String),
+
+    /// The declared image dimensions exceed the configured pixel limit.
+    #[error("image dimensions {width}x{height} exceed maximum {max_pixels} pixels")]
+    ImageTooLarge {
+        width: u32,
+        height: u32,
+        max_pixels: usize,
+    },
 
     /// The HEVC codestream failed to decode, or decoded to something other
     /// than the size the container promised.

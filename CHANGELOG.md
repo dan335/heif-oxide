@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Breaking changes
+
+- Replace `decode_bytes_with_limit(data, (max_width, max_height))` with
+  `decode_bytes_with(data, &Limits)`. Size limits now count pixels rather
+  than bounding each dimension separately. `decode_bytes` and `decode_file`
+  use the default limits.
+- Add non-exhaustive `Limits` with public `usize` fields: `max_pixels`
+  (100,000,000), `max_grid_tiles` (1024), `max_item_payload_bytes` (256 MiB),
+  and `max_picture_memory_bytes` (1 GiB). Construct with `Limits::default()`
+  and modify fields; `Debug` and `Clone` are also implemented.
+- Mark `HeifError` non-exhaustive. `ImageTooLarge` now has `width: u32`,
+  `height: u32`, and `max_pixels: usize` fields instead of separate maximum
+  width and height fields. Downstream error matches need a wildcard arm.
+
+### Security
+
+- Enforce pixel and picture-memory limits in the HEVC decoder using actual
+  bitstream dimensions, including grid tiles and best-effort auxiliary
+  alpha, rather than trusting container `ispe` declarations. HEVC limit
+  violations may return `HeifError::Codec`.
+- Bound declared image sizes before decoding, grid tile counts, aggregate
+  tile pixels, canvas pixels, and assembled item payloads. Grid limits count
+  actual aggregate tile pixels and the full canvas before cropping, even
+  with understated `ispe` declarations. Invalid declared grid aggregates
+  remain `HeifError::Invalid` errors.
+- The picture-memory limit applies per HEVC picture, not to the total
+  memory used by a decode or by concurrently decoded grid tiles.
+
 ## 0.1.1 — 2026-11-18
 
 ### Fixed
