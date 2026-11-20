@@ -45,10 +45,10 @@ and `Clone`. All limits are `usize` values:
 
 | Field | Default | Bounds |
 | --- | --- | --- |
-| `max_pixels` | `100_000_000` | Declared image size, actual HEVC pictures, grid tile aggregate and canvas |
+| `max_pixels` | `100_000_000` | Declared image size, actual HEVC pictures, grid tile aggregate and canvas. One HEVC picture is also capped at 35,651,584 pixels (the largest any HEVC level allows) |
 | `max_grid_tiles` | `1024` | Number of tiles in a grid |
 | `max_item_payload_bytes` | `256 * 1024 * 1024` (256 MiB) | Payload bytes assembled for one item |
-| `max_picture_memory_bytes` | `1024 * 1024 * 1024` (1 GiB) | HEVC decoder memory per picture |
+| `max_picture_memory_bytes` | `512 * 1024 * 1024` (512 MiB) | HEVC decoder memory per picture |
 
 Pixel limits are enforced against HEVC bitstream dimensions as well as
 container declarations, so a small or spoofed `ispe` does not bypass them.
@@ -64,10 +64,6 @@ Declared image sizes above `max_pixels` return
 violations may return `HeifError::Codec`; invalid grid aggregates and other
 container resource violations return `HeifError::Invalid`. `HeifError` is
 non-exhaustive, so downstream matches need a wildcard arm.
-
-This replaces `decode_bytes_with_limit(data, (max_width, max_height))`
-with `decode_bytes_with(data, &limits)`. The new size bound is a pixel count,
-not separate width and height bounds.
 
 ## What works
 

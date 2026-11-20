@@ -316,8 +316,10 @@ fn rejects_oversized_image_before_decoding() {
         payload: vec![0; 16],
         props: vec![(false, tb::ispe(65, 64))],
     }];
-    let mut limits = Limits::default();
-    limits.max_pixels = 64 * 64;
+    let limits = Limits {
+        max_pixels: 64 * 64,
+        ..Limits::default()
+    };
     assert!(matches!(
         decode_bytes_with(&tb::make_heic(&items, 1, &[]), &limits),
         Err(HeifError::ImageTooLarge {
@@ -334,13 +336,37 @@ fn default_limits() {
     assert_eq!(limits.max_pixels, 100_000_000);
     assert_eq!(limits.max_grid_tiles, 1024);
     assert_eq!(limits.max_item_payload_bytes, 256 * 1024 * 1024);
-    assert_eq!(limits.max_picture_memory_bytes, 1024 * 1024 * 1024);
+    assert_eq!(limits.max_picture_memory_bytes, 512 * 1024 * 1024);
+}
+
+/// `max_pixels` lowers the per-picture bound but never raises it past the
+/// largest picture an HEVC level allows — the default (sized for whole grid
+/// canvases) must not loosen what a single picture may allocate.
+#[test]
+fn per_picture_pixel_bound_is_capped() {
+    const HEVC_MAX_LUMA_PICTURE_SIZE: u64 = 35_651_584;
+    assert_eq!(
+        hevc::max_picture_pixels(&Limits::default()),
+        HEVC_MAX_LUMA_PICTURE_SIZE
+    );
+    let huge = Limits {
+        max_pixels: usize::MAX,
+        ..Limits::default()
+    };
+    assert_eq!(hevc::max_picture_pixels(&huge), HEVC_MAX_LUMA_PICTURE_SIZE);
+    let small = Limits {
+        max_pixels: 4096,
+        ..Limits::default()
+    };
+    assert_eq!(hevc::max_picture_pixels(&small), 4096);
 }
 
 #[test]
 fn decodes_image_at_pixel_limit() {
-    let mut limits = Limits::default();
-    limits.max_pixels = 64 * 64;
+    let limits = Limits {
+        max_pixels: 64 * 64,
+        ..Limits::default()
+    };
     let image = decode_bytes_with(&single_item_heic("flat_red_64"), &limits).expect("decode");
     assert_eq!((image.width, image.height), (64, 64));
     assert_flat_rgb8(&image, [254, 0, 0], 1);
@@ -357,8 +383,10 @@ fn rejects_spoofed_dimensions_using_bitstream_pixel_limit() {
     }];
     let file = tb::make_heic(&items, 1, &[]);
     assert_eq!(decode_bytes(&file).expect("decode").width, 64);
-    let mut limits = Limits::default();
-    limits.max_pixels = 256;
+    let limits = Limits {
+        max_pixels: 256,
+        ..Limits::default()
+    };
     assert!(matches!(
         decode_bytes_with(&file, &limits),
         Err(HeifError::Codec(_))
@@ -380,8 +408,10 @@ fn enforces_bitstream_pixel_limit_without_ispe() {
         props: vec![(true, hvcc), (false, nclx_601())],
     }];
     let file = tb::make_heic(&items, 1, &[]);
-    let mut limits = Limits::default();
-    limits.max_pixels = 256;
+    let limits = Limits {
+        max_pixels: 256,
+        ..Limits::default()
+    };
     assert!(matches!(
         decode_bytes_with(&file, &limits),
         Err(HeifError::Codec(_))
@@ -411,8 +441,10 @@ fn enforces_bitstream_pixel_limit_on_grid_tiles() {
     let file = tb::make_heic(&items, 1, &[(*b"dimg", 1, vec![2])]);
     let image = decode_bytes(&file).expect("decode");
     assert_eq!((image.width, image.height), (8, 8));
-    let mut limits = Limits::default();
-    limits.max_pixels = 256;
+    let limits = Limits {
+        max_pixels: 256,
+        ..Limits::default()
+    };
     assert!(matches!(
         decode_bytes_with(&file, &limits),
         Err(HeifError::Codec(_))
@@ -448,8 +480,10 @@ fn enforces_actual_grid_aggregate_before_cropping() {
         },
     ];
     let file = tb::make_heic(&items, 1, &[(*b"dimg", 1, vec![2, 3])]);
-    let mut limits = Limits::default();
-    limits.max_pixels = 4096;
+    let mut limits = Limits {
+        max_pixels: 4096,
+        ..Limits::default()
+    };
     assert!(matches!(
         decode_bytes_with(&file, &limits),
         Err(HeifError::Codec(_))
@@ -486,8 +520,10 @@ fn propagates_pixel_limit_to_alpha_decoder() {
     ];
     let file = tb::make_heic(&items, 1, &[(*b"auxl", 2, vec![1])]);
     let container = boxes::parse(&file).expect("parse");
-    let mut limits = Limits::default();
-    limits.max_pixels = 256;
+    let limits = Limits {
+        max_pixels: 256,
+        ..Limits::default()
+    };
     assert!(decode_alpha_plane(&container, 1, 64, 64, &limits).is_none());
     let alpha = decode_alpha_plane(&container, 1, 64, 64, &Limits::default())
         .expect("decode alpha with default limits");
@@ -505,8 +541,10 @@ fn rejects_grid_output_above_pixel_limit_before_decoding() {
         payload: tb::grid_payload(1, 1, 65, 64),
         props: vec![(false, tb::ispe(8, 8))],
     }];
-    let mut limits = Limits::default();
-    limits.max_pixels = 64 * 64;
+    let limits = Limits {
+        max_pixels: 64 * 64,
+        ..Limits::default()
+    };
     assert!(matches!(
         decode_bytes_with(&tb::make_heic(&items, 1, &[]), &limits),
         Err(HeifError::ImageTooLarge {
@@ -520,8 +558,10 @@ fn rejects_grid_output_above_pixel_limit_before_decoding() {
 #[test]
 fn enforces_custom_picture_memory_limit() {
     let file = single_item_heic("flat_red_64");
-    let mut limits = Limits::default();
-    limits.max_picture_memory_bytes = 1;
+    let mut limits = Limits {
+        max_picture_memory_bytes: 1,
+        ..Limits::default()
+    };
     assert!(matches!(
         decode_bytes_with(&file, &limits),
         Err(HeifError::Codec(_))
@@ -533,8 +573,10 @@ fn enforces_custom_picture_memory_limit() {
 #[test]
 fn enforces_custom_grid_tile_limit() {
     let file = grid_heic("flat_red_64", "flat_blue_64", 100, 50, vec![]);
-    let mut limits = Limits::default();
-    limits.max_grid_tiles = 1;
+    let mut limits = Limits {
+        max_grid_tiles: 1,
+        ..Limits::default()
+    };
     assert!(matches!(
         decode_bytes_with(&file, &limits),
         Err(HeifError::Invalid(message)) if message.contains("maximum is 1")
@@ -555,8 +597,10 @@ fn enforces_custom_item_payload_limit() {
         props: vec![(true, hvcc), (false, tb::ispe(64, 64)), (false, nclx_601())],
     }];
     let file = tb::make_heic(&items, 1, &[]);
-    let mut limits = Limits::default();
-    limits.max_item_payload_bytes = payload_len - 1;
+    let mut limits = Limits {
+        max_item_payload_bytes: payload_len - 1,
+        ..Limits::default()
+    };
     assert!(matches!(
         decode_bytes_with(&file, &limits),
         Err(HeifError::Invalid(_))

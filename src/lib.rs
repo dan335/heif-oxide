@@ -63,7 +63,10 @@ const MAX_TRANSFORMS: usize = 4;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Limits {
-    /// Maximum pixels in a coded picture or a complete grid canvas, before cropping.
+    /// Maximum pixels in a coded picture or a complete grid canvas, before
+    /// cropping. A single coded picture is additionally capped at 35,651,584
+    /// pixels, the largest picture any HEVC level allows, however high this
+    /// is set.
     pub max_pixels: usize,
     /// Maximum number of tiles referenced by a grid.
     pub max_grid_tiles: usize,
@@ -79,7 +82,7 @@ impl Default for Limits {
             max_pixels: 100_000_000,
             max_grid_tiles: 1024,
             max_item_payload_bytes: 256 * 1024 * 1024,
-            max_picture_memory_bytes: 1024 * 1024 * 1024,
+            max_picture_memory_bytes: 512 * 1024 * 1024,
         }
     }
 }

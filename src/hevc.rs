@@ -106,6 +106,17 @@ pub fn build_annex_b(config: &HvcConfig, item_payload: &[u8]) -> Result<Vec<u8>,
     Ok(stream)
 }
 
+/// Pixel bound for one coded picture.
+///
+/// `Limits::max_pixels` also bounds whole grid canvases, which can
+/// legitimately be larger than any single coded picture. One HEVC picture
+/// never exceeds the decoder's own default (35,651,584 luma samples, the
+/// largest picture size of any HEVC level), so a larger `max_pixels` must not
+/// raise the per-picture bound above it.
+pub fn max_picture_pixels(limits: &crate::Limits) -> u64 {
+    (limits.max_pixels as u64).min(DecodeLimits::default().max_picture_pixels)
+}
+
 /// Decode a single still picture from an Annex B stream, returning the first
 /// output frame (a HEIF item is exactly one coded picture).
 pub fn decode_first_frame(annex_b: &[u8], limits: &crate::Limits) -> Result<Frame, HeifError> {
@@ -114,7 +125,7 @@ pub fn decode_first_frame(annex_b: &[u8], limits: &crate::Limits) -> Result<Fram
         return Err(HeifError::Codec("no NAL units in item payload".into()));
     }
     let mut decoder = Decoder::with_limits(DecodeLimits {
-        max_picture_pixels: limits.max_pixels as u64,
+        max_picture_pixels: max_picture_pixels(limits),
         max_picture_memory_bytes: limits.max_picture_memory_bytes as u64,
     });
     for nal in &nals {
