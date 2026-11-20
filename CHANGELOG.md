@@ -9,6 +9,9 @@
   need a wildcard arm.
 - A grid item and each of its tiles must carry an `ispe` property, as the
   specification requires. Files that omit it are rejected.
+- Files are rejected when the primary item has more than four transform
+  properties (`clap`/`irot`/`imir`), or a grid references the same tile
+  twice.
 
 ### Added
 
@@ -18,7 +21,7 @@
   (100,000,000), `max_grid_tiles` (1024), `max_item_payload_bytes` (256 MiB),
   and `max_picture_memory_bytes` (512 MiB). Construct with
   `Limits::default()` and modify fields; `Debug` and `Clone` are also
-  implemented.
+  implemented. (#2, thanks @stephenjudkins; #11)
 
 ### Security
 

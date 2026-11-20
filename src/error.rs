@@ -45,13 +45,17 @@ pub enum HeifError {
     /// The declared image dimensions exceed the configured pixel limit.
     #[error("image dimensions {width}x{height} exceed maximum {max_pixels} pixels")]
     ImageTooLarge {
+        /// Declared width in pixels.
         width: u32,
+        /// Declared height in pixels.
         height: u32,
+        /// The `Limits::max_pixels` in force.
         max_pixels: usize,
     },
 
     /// The HEVC codestream failed to decode, or decoded to something other
-    /// than the size the container promised.
+    /// than the size the container promised. A coded picture that exceeds
+    /// the decode limits also ends up here.
     #[error("HEVC decode failed: {0}")]
     Codec(String),
 }

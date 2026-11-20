@@ -25,6 +25,15 @@
 //! [`read_metadata`] returns the dimensions, bit depth, alpha presence and
 //! colour information without decoding any pixels.
 //!
+//! ## Untrusted input
+//!
+//! Every decode runs under resource [`Limits`]: pixel counts (checked against
+//! the HEVC bitstream, not just what the container declares), grid tile
+//! count, assembled payload size and per-picture decoder memory.
+//! [`decode_bytes`] and [`decode_file`] use [`Limits::default`]; a server
+//! taking uploads can tighten them with [`decode_bytes_with`]. Exceeding a
+//! limit is an ordinary `Err`.
+//!
 //! ## Limitations
 //!
 //! - Decode only — there is no pure-Rust HEVC encoder to pair with.
@@ -60,6 +69,19 @@ pub use error::HeifError;
 const MAX_TRANSFORMS: usize = 4;
 
 /// Resource limits applied before allocating item payloads and decoded pictures.
+///
+/// The struct is `#[non_exhaustive]`, so outside this crate it cannot be
+/// built with a struct literal: start from [`Limits::default`] and set the
+/// fields to change.
+///
+/// ```
+/// let mut limits = heif_oxide::Limits::default();
+/// limits.max_pixels = 24_000_000;
+/// limits.max_grid_tiles = 256;
+/// # let data: Vec<u8> = Vec::new();
+/// let result = heif_oxide::decode_bytes_with(&data, &limits);
+/// # assert!(result.is_err());
+/// ```
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Limits {
@@ -91,9 +113,13 @@ impl Default for Limits {
 /// 12-bit sources produce `*16` (samples scaled to the full 0..65535 range).
 /// `Rgba*` appears only when the file carries a decodable alpha auxiliary.
 pub enum Pixels {
+    /// 8-bit RGB, three samples per pixel.
     Rgb8(Vec<u8>),
+    /// 8-bit RGBA, four samples per pixel.
     Rgba8(Vec<u8>),
+    /// 16-bit RGB, three samples per pixel.
     Rgb16(Vec<u16>),
+    /// 16-bit RGBA, four samples per pixel.
     Rgba16(Vec<u16>),
 }
 
@@ -127,9 +153,13 @@ pub struct ImageMetadata {
 
 /// A decoded HEIF image: display-ready sRGB with orientation applied.
 pub struct DecodedImage {
+    /// Width in pixels, after cropping and orientation.
     pub width: u32,
+    /// Height in pixels, after cropping and orientation.
     pub height: u32,
+    /// Interleaved samples, row-major from the top-left corner.
     pub pixels: Pixels,
+    /// What the container declared about colour.
     pub color: ColorInfo,
 }
 
@@ -182,7 +212,7 @@ impl DecodedImage {
     }
 }
 
-/// Decode a HEIF/HEIC file from disk.
+/// Decode a HEIF/HEIC file from disk, with [`Limits::default`].
 pub fn decode_file<P: AsRef<Path>>(path: P) -> Result<DecodedImage, HeifError> {
     decode_bytes(&std::fs::read(path)?)
 }
@@ -259,7 +289,7 @@ pub fn read_metadata(data: &[u8]) -> Result<ImageMetadata, HeifError> {
     })
 }
 
-/// Decode a HEIF/HEIC file already in memory.
+/// Decode a HEIF/HEIC file already in memory, with [`Limits::default`].
 pub fn decode_bytes(data: &[u8]) -> Result<DecodedImage, HeifError> {
     decode_bytes_with(data, &Limits::default())
 }
